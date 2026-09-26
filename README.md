@@ -4,13 +4,25 @@
 
 A community plugin that brings the multi-agent collaboration experience of [Google Antigravity](https://antigravity.google)'s **Teamwork** (`/teamwork-preview`) to OpenCode: a scoping interview, a reviewable prompt artifact, an autonomous multi-agent build driven by a deterministic state machine, and adversarial verification gates that demand real evidence — all inside your terminal.
 
+> **Development status:** this plugin is under active development and is **not suitable for production use**. Expect breaking changes, incomplete features, and unstable behavior.
+
 > Adapted from [`@prevalentware/opencode-goal-plugin`](https://github.com/prevalentWare/opencode-goal-plugin), which added Codex-style goal mode to OpenCode. Goal mode lives on in the upstream package; this plugin replaces it with teamwork and is designed to run alongside it.
+
+## Recommended Skill
+
+[`sandlada/skill-teamwork`](https://github.com/sandlada/skill-teamwork) — the native-subagent teamwork orchestration Skill that pairs with this plugin.
+
+> If you use the `teamwork` Skill, you do not need this plugin. The Skill covers the same multi-agent teamwork workflow on its own — install this plugin only if you specifically need its extras (deterministic Sentinel state machine, persisted project state, TUI sidebar, `/teamwork*` commands).
+
+## Recommended Model
+
+Prefer a model with native subagent support (one that can fan out parallel `task`/`subagent` calls inside a single turn). The default `native` executor depends on it: without subagent support, parallel tracks fall back to sequential work and stall reminders will fire. If your model cannot spawn subagents, either switch the project to the `isolated` executor (separate sessions, strong isolation, slower) or switch to a model that can.
 
 ## How it works
 
 ### Phase 1 — Scoping interview
 
-`/teamwork <prompt>` starts a structured interview that follows Antigravity's *Specify What, Not How* principle: scope & objectives, requirements, independent verification per requirement, acceptance criteria, working-directory confirmation, and an integrity mode (which shortcuts are off-limits). The result is a reviewable **prompt artifact** committed to your repo.
+`/teamwork <prompt>` starts a structured interview that follows Antigravity's *Specify What, Not How* principle: scope & objectives, requirements, independent verification per requirement, acceptance criteria, working-directory confirmation, an integrity mode (which shortcuts are off-limits), an executor (`native` vs `isolated`, default `native`), and max parallel tracks within a phase (default 5, cap 8). The result is a reviewable **prompt artifact** committed to your repo (it records the chosen executor and parallelism).
 
 ### The gate — human approval
 
@@ -34,10 +46,10 @@ Auditor               checks the work against the integrity mode and real comman
 ... next milestone ...  →  Success Auditor  →  done
 ```
 
-- **Eight roles, seven sessions.** Sentinel is the plugin itself; the other roles are real hidden subagents with their own system prompts and permissions (explorers and reviewers cannot edit files).
-- **Verification gates are enforced, not suggested.** A failed gate loops the work back to the workers (same session, with the findings as context) until the configured retry ceiling (`max_verification_retries`, default 2), then pauses the project and tells you exactly what is stuck.
-- **Reports or failure.** Every role session must submit a structured `teamwork_report`; a session that ends without one has failed its task. Fabricated evidence is a failure by definition.
-- **Everything is reviewable.** `request.md`, `plan.md`, and `progress.md` live in `.opencode/teamwork/<slug>/` as real markdown, and the TUI sidebar shows live phase, milestone progress, active tracks, and budget usage.
+- **Eight roles, two executors.** Sentinel is the plugin itself; the other roles run either as separate hidden sessions (`isolated`: strong isolation, slow) or as native subagent fan-out inside the main session (`native`: fast, prompt-level isolation, default). Gates stay strict in both modes: every role still submits `teamwork_report` with verbatim command output, and the Auditor reruns claimed commands.
+- **Verification gates are enforced, not suggested.** A failed gate loops the work back to the workers (isolated: same sessions re-prompted in parallel; native: one batch re-prompt to the main session) until the configured retry ceiling (`max_verification_retries`, default 2), then pauses the project and tells you exactly what is stuck.
+- **Reports or failure.** Every role session must submit a structured `teamwork_report`; a session that ends without one has failed its task. In `native` mode the main LLM relays one report per track; pasted evidence must be verbatim subagent output. Fabricated evidence is a failure by definition.
+- **Everything is reviewable, and progress is narrated.** `request.md`, `plan.md`, and `progress.md` live in `.opencode/teamwork/<slug>/` as real markdown, and the TUI sidebar shows live phase, executor, milestone progress, active tracks, and budget usage. Every finished track posts a short main-session summary (`track id + verdict + findings/evidence excerpts + running/queued`); permission waits post `[NEEDS-APPROVAL]` immediately and suspend wall-clock accounting, and a soft per-track stall reminder (default 30 min, reminder-only) guards against silent stalls.
 
 ### Where role sessions show up
 
@@ -59,14 +71,14 @@ Teamwork role sessions appear in your OpenCode session list while a project runs
 
 | Command | Purpose |
 | --- | --- |
-| `/teamwork <prompt>` | Start the Phase 1 scoping interview |
+| `/teamwork <prompt>` | Start the Phase 1 scoping interview (asks executor + parallelism) |
 | `/teamwork-approve` | Approve the prompt artifact and start Phase 2 |
-| `/teamwork-revise <...>` | Apply revisions to the artifact, re-await approval |
-| `/teamwork-status` | Detailed project status |
+| `/teamwork-revise <...>` | Apply revisions to the artifact, re-await approval; while `paused` it can also switch `executor` |
+| `/teamwork-status` | Detailed project status (includes executor, parallelism, queue depth) |
 | `/teamwork-pause` / `/teamwork-resume` | Pause and resume the team |
 | `/teamwork-cancel` | Cancel the project |
 
-Projects are budget-aware: optional token / wall-clock / team-session budgets across **all** role sessions combined, with graceful wrap-up when a limit hits. Parallelism is capped by `max_parallel_workers` (default 3).
+Projects are budget-aware: optional token / wall-clock / team-session budgets across **all** role sessions combined, with graceful wrap-up when a limit hits. Permission waits never consume wall-clock time. Parallelism is capped by `max_parallel_workers` (default 5, cap 8, within-phase only; milestones and `explorer → worker → gates` barriers stay strict).
 
 ## Installation
 
@@ -89,8 +101,10 @@ All options are optional plugin options:
       "package": "@sandlada/opencode-teamwork",
       "options": {
         "locale": "auto",
-        "max_parallel_workers": 3,
+        "executor": "native",
+        "max_parallel_workers": 5,
         "max_verification_retries": 2,
+        "track_stall_reminder_seconds": 1800,
         "default_token_budget": null,
         "max_auto_turns": null,
         "max_duration_seconds": null,
@@ -100,6 +114,8 @@ All options are optional plugin options:
   ]
 }
 ```
+
+`executor` (`native` default, or `isolated`) can also be set per project by the interview (`teamwork_create_project.executor`) and switched later via `teamwork_revise` while `awaitingApproval`/`paused` (never mid-`executing`). Projects created before this option existed normalize to the global default (`native`). `track_stall_reminder_seconds` (`null` disables) is a soft reminder only — it never fails a track.
 
 ## Development
 

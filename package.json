@@ -1,6 +1,6 @@
 {
   "name": "@sandlada/opencode-teamwork",
-  "version": "0.0.1-20260926.c",
+  "version": "0.0.1-20260926.d",
   "description": "OpenCode plugin that brings Antigravity-style multi-agent teamwork (/teamwork) to OpenCode: scoping interview, milestone state machine, adversarial verification gates, and a TUI status sidebar.",
   "keywords": [
     "opencode",
