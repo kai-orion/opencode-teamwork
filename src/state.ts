@@ -5,117 +5,100 @@ import { homedir } from "node:os"
 import { dirname, join } from "node:path"
 import { Data, Effect, Schema } from "effect"
 import { atomicWriteFile } from "./atomic-write"
+import type { IntegrityMode, Phase, TeamworkLocale } from "./i18n"
 
-export type GoalStatus = "active" | "paused" | "budgetLimited" | "usageLimited" | "complete" | "unmet"
-export type MutableGoalStatus = "active" | "paused"
-export type GoalHistoryType =
+export type { IntegrityMode, Phase }
+
+export type TeamRole =
+  | "orchestrator"
+  | "explorer"
+  | "worker"
+  | "critic"
+  | "challenger"
+  | "auditor"
+  | "successAuditor"
+
+export type MilestoneStatus = "pending" | "inProgress" | "verification" | "passed" | "failed"
+export type TrackStatus = "queued" | "running" | "awaitingVerification" | "passed" | "failed"
+export type Verdict = "pass" | "fail" | "blocked"
+
+export type ProjectHistoryType =
   | "created"
   | "updated"
+  | "artifact"
+  | "approved"
   | "paused"
   | "resumed"
+  | "milestone"
+  | "verification"
   | "completed"
-  | "unmet"
-  | "autoContinue"
-  | "checkpoint"
+  | "cancelled"
   | "warning"
   | "limited"
   | "error"
 
-export type GoalHistoryEntry = {
-  type: GoalHistoryType
+export type ProjectHistoryEntry = {
+  type: ProjectHistoryType
   detail: string
   timestamp: number
 }
 
-export type GoalCheckpoint = {
-  summary: string
+export type Brief = {
+  name: string
+  objectives: string
+  requirements: string
+  verification: string
+  acceptanceCriteria: string
+  integrityMode: IntegrityMode
+  artifactLocale: TeamworkLocale
+}
+
+export type RoleReport = {
+  role: TeamRole
+  verdict: Verdict
+  findings: string[]
+  evidence: string[]
+  blockers: string[]
+  artifactsWritten: string[]
+  submittedAt: number
+}
+
+export type Track = {
+  id: string
+  title: string
+  role: TeamRole
+  assignedFiles: string[]
+  status: TrackStatus
+  /** The role session executing this track; null while queued. */
+  sessionID: string | null
+  attempt: number
+  lastReport: RoleReport | null
+}
+
+export type Milestone = {
+  id: string
+  title: string
+  description: string
+  status: MilestoneStatus
+  tracks: Track[]
+  verificationAttempts: number
+}
+
+export type SentinelUpdate = {
+  message: string
   timestamp: number
 }
 
-export type CreateGoalOptions = {
+export type CreateProjectOptions = {
   tokenBudget?: number | null
   maxAutoTurns?: number | null
   maxDurationSeconds?: number | null
-  noProgressTokenThreshold?: number | null
-  maxNoProgressTurns?: number | null
-  agent?: string | null
-  initialStatus?: MutableGoalStatus
-  maxObjectiveChars?: number | null
+  maxParallelWorkers?: number | null
+  maxVerificationRetries?: number | null
+  workingDirectory?: string | null
 }
 
-export type AssistantProgressInput = {
-  messageID?: string
-  text?: string
-  outputTokens?: number | null
-  noProgressTokenThreshold?: number | null
-  maxNoProgressTurns?: number | null
-  evaluateContinuation?: boolean
-  /** Millisecond completedAt of the assistant message, for correlating progress to the current attempt. */
-  completedAt?: number | null
-}
-
-/**
- * A single automatic-continuation attempt. It is persisted BEFORE the prompt
- * is delivered so that out-of-band events (a session status "busy" that races
- * the prompt resolution) can correlate to the correct attempt instead of
- * relying on local-only function timing. The attempt is internal: it is never
- * exposed on the public GoalSnapshot / tool JSON.
- */
-export type PendingAttempt = {
-  /** Stable identity for the attempt, used to correlate busy/error/progress events. */
-  id: string
-  /** Millisecond timestamp used as the minimum-interval and staleness anchor. */
-  reservedAt: number
-  /** The provider picked the prompt up (a session.status busy fired). */
-  started: boolean
-  /** The prompt was confirmed delivered (promptAsync / session.prompt resolved). */
-  delivered: boolean
-  /** autoTurns / lastContinuationAt were committed for this attempt. */
-  committed: boolean
-  /** Whether the delivered prompt should arm the no-progress evaluation. */
-  armNoProgress: boolean
-  /** lastContinuationAt value to restore if this unconsumed attempt is rolled back. */
-  previousLastContinuationAt: number | null
-}
-
-export type Goal = {
-  sessionID: string
-  objective: string
-  status: GoalStatus
-  tokenBudget: number | null
-  tokensUsed: number
-  usageTrackers: Record<string, UsageTracker>
-  timeUsedSeconds: number
-  createdAt: number
-  updatedAt: number
-  completionEvidence?: string | null
-  blocker?: string | null
-  closedAt?: number | null
-  lastAccountedAt: number | null
-  autoTurns: number
-  lastContinuationAt: number | null
-  continuationFailures: number
-  pendingAttempt: PendingAttempt | null
-  lastStatus: string | null
-  maxAutoTurns: number | null
-  maxDurationSeconds: number | null
-  noProgressTokenThreshold: number | null
-  maxNoProgressTurns: number | null
-  noProgressTurns: number
-  budgetWrapupSent: boolean
-  stopReason: string | null
-  history: GoalHistoryEntry[]
-  checkpoints: GoalCheckpoint[]
-  lastCheckpoint: GoalCheckpoint | null
-  lastAssistantText: string
-  lastAssistantMessageID: string
-  lastPromptAgent: string | null
-  awaitingContinuationProgress: boolean
-  continuationBaselineMessageID: string
-  continuationBaselineSummary: string
-}
-
-type UsageTracker = {
+export type UsageTracker = {
   baseline: number
   lastObserved: number
   baseTokens: number
@@ -123,9 +106,41 @@ type UsageTracker = {
   pendingBaseTokens: number | null
 }
 
+export type Project = {
+  sessionID: string
+  slug: string
+  brief: Brief
+  phase: Phase
+  milestones: Milestone[]
+  activeMilestoneIndex: number
+  artifacts: { request: string; plan: string; progress: string } | null
+  workingDirectory: string | null
+  tokenBudget: number | null
+  tokensUsed: number
+  usageTrackers: Record<string, UsageTracker>
+  timeUsedSeconds: number
+  lastAccountedAt: number | null
+  /** Role sessions spawned since the last resume; counts against maxAutoTurns. */
+  sessionsSpawned: number
+  maxAutoTurns: number | null
+  maxDurationSeconds: number | null
+  maxParallelWorkers: number
+  maxVerificationRetries: number
+  planPaused: boolean
+  sentinelUpdate: SentinelUpdate | null
+  history: ProjectHistoryEntry[]
+  completionEvidence: string | null
+  blocker: string | null
+  closedAt: number | null
+  stopReason: string | null
+  lastStatus: string | null
+  createdAt: number
+  updatedAt: number
+}
+
 type State = {
   version: 1
-  goals: Record<string, Goal>
+  projects: Record<string, Project>
 }
 
 class StateReadError extends Data.TaggedError("StateReadError")<{
@@ -140,28 +155,25 @@ class StateWriteError extends Data.TaggedError("StateWriteError")<{
   readonly cause: unknown
 }> {}
 
-const MAX_HISTORY_ENTRIES = 50
-const MAX_CHECKPOINTS = 8
-const MAX_LISTED_GOALS = 50
+const MAX_HISTORY_ENTRIES = 80
 const CHECKPOINT_CHAR_LIMIT = 280
-const DEFAULT_NO_PROGRESS_TOKEN_THRESHOLD = 50
-const DEFAULT_MAX_NO_PROGRESS_TURNS = 2
-const MAX_AUTO_CONTINUES_STOP_REASON_PREFIX = "max auto-continues reached ("
-export const PLAN_MODE_STOP_REASON = "plan mode"
-export const PLAN_MODE_BLOCKER =
-  "Goal execution is paused while the session is in Plan mode. Switch to Build mode and resume the goal to continue."
-const NullableString = Schema.NullOr(Schema.String)
-const NullableNumber = Schema.NullOr(Schema.Number)
+const DEFAULT_MAX_PARALLEL_WORKERS = 3
+const DEFAULT_MAX_VERIFICATION_RETRIES = 2
+const NULLABLE_STRING = Schema.NullOr(Schema.String)
+const NULLABLE_NUMBER = Schema.NullOr(Schema.Number)
+
 const HistoryEntrySchema = Schema.Struct({
   type: Schema.Literal(
     "created",
     "updated",
+    "artifact",
+    "approved",
     "paused",
     "resumed",
+    "milestone",
+    "verification",
     "completed",
-    "unmet",
-    "autoContinue",
-    "checkpoint",
+    "cancelled",
     "warning",
     "limited",
     "error",
@@ -169,19 +181,68 @@ const HistoryEntrySchema = Schema.Struct({
   detail: Schema.String,
   timestamp: Schema.Number,
 })
-const CheckpointSchema = Schema.Struct({
-  summary: Schema.String,
+
+const BriefSchema = Schema.Struct({
+  name: Schema.String,
+  objectives: Schema.String,
+  requirements: Schema.String,
+  verification: Schema.String,
+  acceptanceCriteria: Schema.String,
+  integrityMode: Schema.Literal("development", "demo", "benchmark"),
+  artifactLocale: Schema.Literal("en", "zh-TW", "zh-CN"),
+})
+
+const RoleReportSchema = Schema.Struct({
+  role: Schema.Literal(
+    "orchestrator",
+    "explorer",
+    "worker",
+    "critic",
+    "challenger",
+    "auditor",
+    "successAuditor",
+  ),
+  verdict: Schema.Literal("pass", "fail", "blocked"),
+  findings: Schema.optionalWith(Schema.Array(Schema.String), { default: () => [] }),
+  evidence: Schema.optionalWith(Schema.Array(Schema.String), { default: () => [] }),
+  blockers: Schema.optionalWith(Schema.Array(Schema.String), { default: () => [] }),
+  artifactsWritten: Schema.optionalWith(Schema.Array(Schema.String), { default: () => [] }),
+  submittedAt: Schema.Number,
+})
+
+const TrackSchema = Schema.Struct({
+  id: Schema.String,
+  title: Schema.String,
+  role: Schema.Literal(
+    "orchestrator",
+    "explorer",
+    "worker",
+    "critic",
+    "challenger",
+    "auditor",
+    "successAuditor",
+  ),
+  assignedFiles: Schema.optionalWith(Schema.Array(Schema.String), { default: () => [] }),
+  status: Schema.Literal("queued", "running", "awaitingVerification", "passed", "failed"),
+  sessionID: Schema.optionalWith(NULLABLE_STRING, { default: () => null }),
+  attempt: Schema.optionalWith(Schema.Number, { default: () => 0 }),
+  lastReport: Schema.optionalWith(Schema.NullOr(RoleReportSchema), { default: () => null }),
+})
+
+const MilestoneSchema = Schema.Struct({
+  id: Schema.String,
+  title: Schema.String,
+  description: Schema.String,
+  status: Schema.Literal("pending", "inProgress", "verification", "passed", "failed"),
+  tracks: Schema.optionalWith(Schema.Array(TrackSchema), { default: () => [] }),
+  verificationAttempts: Schema.optionalWith(Schema.Number, { default: () => 0 }),
+})
+
+const SentinelUpdateSchema = Schema.Struct({
+  message: Schema.String,
   timestamp: Schema.Number,
 })
-const PendingAttemptSchema = Schema.Struct({
-  id: Schema.String,
-  reservedAt: Schema.Number,
-  started: Schema.Boolean,
-  delivered: Schema.Boolean,
-  committed: Schema.Boolean,
-  armNoProgress: Schema.Boolean,
-  previousLastContinuationAt: Schema.NullOr(Schema.Number),
-})
+
 const UsageTrackerSchema = Schema.Struct({
   baseline: Schema.optionalWith(Schema.Unknown, { default: () => null }),
   lastObserved: Schema.optionalWith(Schema.Unknown, { default: () => null }),
@@ -189,91 +250,69 @@ const UsageTrackerSchema = Schema.Struct({
   pendingBaseline: Schema.optionalWith(Schema.Unknown, { default: () => null }),
   pendingBaseTokens: Schema.optionalWith(Schema.Unknown, { default: () => null }),
 })
-const GoalSchema = Schema.Struct({
+
+const ArtifactsSchema = Schema.Struct({
+  request: Schema.String,
+  plan: Schema.String,
+  progress: Schema.String,
+})
+
+const ProjectSchema = Schema.Struct({
   sessionID: Schema.String,
-  objective: Schema.String,
-  status: Schema.Literal("active", "paused", "budgetLimited", "usageLimited", "complete", "unmet"),
-  tokenBudget: NullableNumber,
-  tokensUsed: Schema.Number,
-  usageTrackers: Schema.optionalWith(Schema.Record({ key: Schema.String, value: UsageTrackerSchema }), { default: () => ({}) }),
-  timeUsedSeconds: Schema.Number,
+  slug: Schema.String,
+  brief: BriefSchema,
+  phase: Schema.Literal(
+    "interview",
+    "awaitingApproval",
+    "executing",
+    "paused",
+    "budgetLimited",
+    "complete",
+    "cancelled",
+  ),
+  milestones: Schema.optionalWith(Schema.Array(MilestoneSchema), { default: () => [] }),
+  activeMilestoneIndex: Schema.optionalWith(Schema.Number, { default: () => -1 }),
+  artifacts: Schema.optionalWith(Schema.NullOr(ArtifactsSchema), { default: () => null }),
+  workingDirectory: Schema.optionalWith(NULLABLE_STRING, { default: () => null }),
+  tokenBudget: Schema.optionalWith(NULLABLE_NUMBER, { default: () => null }),
+  tokensUsed: Schema.optionalWith(Schema.Number, { default: () => 0 }),
+  usageTrackers: Schema.optionalWith(
+    Schema.Record({ key: Schema.String, value: UsageTrackerSchema }),
+    { default: () => ({}) },
+  ),
+  timeUsedSeconds: Schema.optionalWith(Schema.Number, { default: () => 0 }),
+  lastAccountedAt: Schema.optionalWith(NULLABLE_NUMBER, { default: () => null }),
+  sessionsSpawned: Schema.optionalWith(Schema.Number, { default: () => 0 }),
+  maxAutoTurns: Schema.optionalWith(NULLABLE_NUMBER, { default: () => null }),
+  maxDurationSeconds: Schema.optionalWith(NULLABLE_NUMBER, { default: () => null }),
+  maxParallelWorkers: Schema.optionalWith(Schema.Number, { default: () => DEFAULT_MAX_PARALLEL_WORKERS }),
+  maxVerificationRetries: Schema.optionalWith(Schema.Number, { default: () => DEFAULT_MAX_VERIFICATION_RETRIES }),
+  planPaused: Schema.optionalWith(Schema.Boolean, { default: () => false }),
+  sentinelUpdate: Schema.optionalWith(Schema.NullOr(SentinelUpdateSchema), { default: () => null }),
+  history: Schema.optionalWith(Schema.Array(HistoryEntrySchema), { default: () => [] }),
+  completionEvidence: Schema.optionalWith(NULLABLE_STRING, { default: () => null }),
+  blocker: Schema.optionalWith(NULLABLE_STRING, { default: () => null }),
+  closedAt: Schema.optionalWith(NULLABLE_NUMBER, { default: () => null }),
+  stopReason: Schema.optionalWith(NULLABLE_STRING, { default: () => null }),
+  lastStatus: Schema.optionalWith(NULLABLE_STRING, { default: () => null }),
   createdAt: Schema.Number,
   updatedAt: Schema.Number,
-  completionEvidence: Schema.optionalWith(NullableString, { default: () => null }),
-  blocker: Schema.optionalWith(NullableString, { default: () => null }),
-  closedAt: Schema.optionalWith(NullableNumber, { default: () => null }),
-  lastAccountedAt: NullableNumber,
-  autoTurns: Schema.Number,
-  lastContinuationAt: NullableNumber,
-  continuationFailures: Schema.optionalWith(Schema.Number, { default: () => 0 }),
-  pendingAttempt: Schema.optionalWith(Schema.NullOr(PendingAttemptSchema), { default: () => null }),
-  lastStatus: Schema.optionalWith(NullableString, { default: () => null }),
-  maxAutoTurns: Schema.optionalWith(NullableNumber, { default: () => null }),
-  maxDurationSeconds: Schema.optionalWith(NullableNumber, { default: () => null }),
-  noProgressTokenThreshold: Schema.optionalWith(NullableNumber, { default: () => DEFAULT_NO_PROGRESS_TOKEN_THRESHOLD }),
-  maxNoProgressTurns: Schema.optionalWith(NullableNumber, { default: () => DEFAULT_MAX_NO_PROGRESS_TURNS }),
-  noProgressTurns: Schema.optionalWith(Schema.Number, { default: () => 0 }),
-  budgetWrapupSent: Schema.optionalWith(Schema.Boolean, { default: () => false }),
-  stopReason: Schema.optionalWith(NullableString, { default: () => null }),
-  history: Schema.optionalWith(Schema.Array(HistoryEntrySchema), { default: () => [] }),
-  checkpoints: Schema.optionalWith(Schema.Array(CheckpointSchema), { default: () => [] }),
-  lastCheckpoint: Schema.optionalWith(Schema.NullOr(CheckpointSchema), { default: () => null }),
-  lastAssistantText: Schema.optionalWith(Schema.String, { default: () => "" }),
-  lastAssistantMessageID: Schema.optionalWith(Schema.String, { default: () => "" }),
-  lastPromptAgent: Schema.optionalWith(NullableString, { default: () => null }),
-  awaitingContinuationProgress: Schema.optionalWith(Schema.Boolean, { default: () => false }),
-  continuationBaselineMessageID: Schema.optionalWith(Schema.String, { default: () => "" }),
-  continuationBaselineSummary: Schema.optionalWith(Schema.String, { default: () => "" }),
 })
+
 const StateSchema = Schema.Struct({
   version: Schema.Literal(1),
-  goals: Schema.Record({ key: Schema.String, value: GoalSchema }),
+  projects: Schema.Record({ key: Schema.String, value: ProjectSchema }),
 })
-
-// The public snapshot omits internal transport-recovery fields. The internal
-// continuation machinery (server and tests) reads them through
-// getGoalInternal / the internal snapshot type instead.
-export type GoalSnapshot = Omit<
-  Goal,
-  "lastAccountedAt" | "autoTurns" | "lastContinuationAt" | "pendingAttempt" | "usageTrackers"
-> & {
-  remainingTokens: number | null
-  sampledAt: number
-  autoTurns: number
-  lastContinuationAt: number | null
-}
-
-/** Internal view of a goal with the pending-attempt lifecycle exposed. */
-export type InternalGoalSnapshot = GoalSnapshot & {
-  pendingAttempt: PendingAttempt | null
-}
-
-export type GoalListItem = Pick<
-  Goal,
-  | "sessionID"
-  | "objective"
-  | "status"
-  | "tokenBudget"
-  | "tokensUsed"
-  | "timeUsedSeconds"
-  | "createdAt"
-  | "updatedAt"
-  | "closedAt"
-  | "maxAutoTurns"
-  | "maxDurationSeconds"
-  | "autoTurns"
-  | "stopReason"
-> & { remainingTokens: number | null }
 
 function defaultStateFile() {
   const dataHome =
     process.env.XDG_DATA_HOME ||
     (process.platform === "win32" && process.env.APPDATA ? process.env.APPDATA : join(homedir(), ".local", "share"))
-  return join(dataHome, "opencode-goal-plugin", "goals.json")
+  return join(dataHome, "opencode-teamwork", "projects.json")
 }
 
 export function statePath() {
-  return process.env.OPENCODE_GOAL_STATE_PATH || defaultStateFile()
+  return process.env.OPENCODE_TEAMWORK_STATE_PATH || defaultStateFile()
 }
 
 function nowSeconds() {
@@ -281,7 +320,7 @@ function nowSeconds() {
 }
 
 function emptyState(): State {
-  return { version: 1, goals: {} }
+  return { version: 1, projects: {} }
 }
 
 function isMissingStateFile(error: unknown) {
@@ -319,7 +358,7 @@ function notifyStateRecovery(notice: StateRecoveryNotice) {
       .catch((error) => {
         try {
           console.error(
-            `[opencode-goal-plugin] Failed to report quarantined state at ${notice.quarantineFile}:`,
+            "[opencode-teamwork] Failed to report quarantined state:",
             error instanceof Error ? error.message : String(error),
           )
         } catch {
@@ -334,18 +373,29 @@ function isStatePadding(character: string) {
 }
 
 function parseStateText(raw: string, file: string) {
-  // trim handles whitespace and UTF-8 BOMs. NUL padding can remain after an
-  // interrupted filesystem write, so tolerate it only at the file boundaries.
   let start = 0
   let end = raw.length
   while (start < end && isStatePadding(raw[start]!)) start += 1
   while (end > start && isStatePadding(raw[end - 1]!)) end -= 1
   const content = raw.slice(start, end)
-  if (content) return { value: JSON.parse(content) as unknown, recoveryContent: null }
+  if (content) {
+    try {
+      return { value: JSON.parse(content) as unknown, recoveryContent: null }
+    } catch {
+      // Unparseable content (interrupted write, editor crash, encoding damage):
+      // quarantine the raw bytes and recover with empty state instead of
+      // hard-failing every project operation forever.
+      if (!warnedEmptyStatePaths.has(file)) {
+        warnedEmptyStatePaths.add(file)
+        console.warn(`[opencode-teamwork] Unparseable state file at ${file}; quarantining and recovering with empty state.`)
+      }
+      return { value: emptyState(), recoveryContent: raw }
+    }
+  }
 
   if (!warnedEmptyStatePaths.has(file)) {
     warnedEmptyStatePaths.add(file)
-    console.warn(`[opencode-goal-plugin] Empty or zero-filled state file at ${file}; recovering with empty state.`)
+    console.warn(`[opencode-teamwork] Empty or zero-filled state file at ${file}; recovering with empty state.`)
   }
   return { value: emptyState(), recoveryContent: raw || null }
 }
@@ -405,7 +455,7 @@ function verifyRecoverySourceEffect(file: string, expectedContent: string, quara
       if (!isMissingStateFile(error)) {
         try {
           console.error(
-            `[opencode-goal-plugin] Could not re-read ${file} after preserving it at ${quarantineFile}; continuing recovery:`,
+            `[opencode-teamwork] Could not re-read ${file} after preserving it at ${quarantineFile}; continuing recovery:`,
             error instanceof Error ? error.message : String(error),
           )
         } catch {
@@ -421,16 +471,6 @@ function writeStateEffect(state: State, file = statePath()) {
   return Effect.tryPromise({
     try: async () => {
       await mkdir(dirname(file), { recursive: true, mode: 0o700 })
-      // atomicWriteFile writes to a same-directory temp file, fsyncs it, then
-      // renames it into place: the final path is only ever replaced by a
-      // fully-flushed file, so after a process or OS crash the state is the
-      // old or the new valid version, never a torn or empty file. Ordinary
-      // fsync improves crash consistency but is not `F_FULLFSYNC`, so sudden
-      // power loss on macOS/APFS has no absolute durability guarantee. Where
-      // the platform supports it, the parent directory is also fsync'd after
-      // the rename so the rename itself survives a crash; where it does not
-      // (Windows / some filesystems) the write still succeeds and a crash
-      // leaves either the old or the new valid state, never a torn file.
       await atomicWriteFile(file, JSON.stringify(state, null, 2) + "\n")
     },
     catch: (cause) => new StateWriteError({ cause }),
@@ -484,7 +524,7 @@ async function mutate<T>(fn: (state: State) => T | Promise<T>) {
             }
             try {
               console.error(
-                `[opencode-goal-plugin] Could not quarantine corrupt state at ${file}; continuing recovery:`,
+                `[opencode-teamwork] Could not quarantine corrupt state at ${file}; continuing recovery:`,
                 quarantine.error,
               )
             } catch {
@@ -494,7 +534,7 @@ async function mutate<T>(fn: (state: State) => T | Promise<T>) {
           } else {
             const unchanged = yield* verifyRecoverySourceEffect(file, recoveryContent, quarantine.quarantineFile)
             if (!unchanged) {
-              const message = "goal state changed while recovery was being quarantined; refusing to overwrite it"
+              const message = "project state changed while recovery was being quarantined; refusing to overwrite it"
               notifyStateRecovery({
                 stateFile: file,
                 quarantineFile: quarantine.quarantineFile,
@@ -505,7 +545,7 @@ async function mutate<T>(fn: (state: State) => T | Promise<T>) {
             }
             try {
               console.warn(
-                `[opencode-goal-plugin] Preserved corrupt state from ${file} at ${quarantine.quarantineFile}; continuing recovery.`,
+                `[opencode-teamwork] Preserved corrupt state from ${file} at ${quarantine.quarantineFile}; continuing recovery.`,
               )
             } catch {
               // Diagnostics must never block state recovery.
@@ -524,57 +564,54 @@ async function mutate<T>(fn: (state: State) => T | Promise<T>) {
   })
 }
 
-export const DEFAULT_MAX_OBJECTIVE_CHARS = 100_000
-
-export function resolveMaxObjectiveChars(value: number | null | undefined) {
-  return typeof value === "number" && Number.isSafeInteger(value) && value > 0 ? value : DEFAULT_MAX_OBJECTIVE_CHARS
-}
-
-function boundedText(value: string, limit: number, label: string) {
-  if ([...value].length > limit) throw new Error(`${label} must be at most ${limit} characters`)
-  const trimmed = value.trim()
-  if (!trimmed) throw new Error(`${label} must not be empty`)
-  return trimmed
-}
-
-export function validateObjective(objective: string, limit = DEFAULT_MAX_OBJECTIVE_CHARS) {
-  return boundedText(objective, limit, "goal objective")
-}
-
-export function validateEvidence(evidence: string | null | undefined, label: string, limit = DEFAULT_MAX_OBJECTIVE_CHARS) {
-  return boundedText(evidence ?? "", limit, label)
-}
+// ---------------------------------------------------------------------------
+// Normalization
+// ---------------------------------------------------------------------------
 
 function normalizeState(state: State): State {
-  for (const goal of Object.values(state.goals)) normalizeGoal(goal)
+  for (const project of Object.values(state.projects)) normalizeProject(project)
   return state
 }
 
-function normalizeGoal(goal: Goal) {
-  goal.history = (goal.history ?? []).slice(-MAX_HISTORY_ENTRIES)
-  goal.checkpoints = (goal.checkpoints ?? []).slice(-MAX_CHECKPOINTS)
-  goal.lastCheckpoint = goal.lastCheckpoint ?? goal.checkpoints.at(-1) ?? null
-  goal.lastAssistantText ??= ""
-  goal.lastAssistantMessageID ??= ""
-  goal.lastPromptAgent ??= null
-  goal.awaitingContinuationProgress = goal.awaitingContinuationProgress === true
-  goal.lastContinuationAt =
-    typeof goal.lastContinuationAt === "number" && Number.isFinite(goal.lastContinuationAt)
-      ? Math.floor(goal.lastContinuationAt >= 1_000_000_000_000 ? goal.lastContinuationAt / 1000 : goal.lastContinuationAt)
-      : null
-  goal.pendingAttempt = normalizePendingAttempt(goal.pendingAttempt)
-  goal.continuationBaselineMessageID ??= ""
-  goal.continuationBaselineSummary ??= ""
-  goal.noProgressTurns = nonNegativeInteger(goal.noProgressTurns, 0)
-  goal.maxAutoTurns = positiveIntegerOrNull(goal.maxAutoTurns)
-  goal.maxDurationSeconds = positiveIntegerOrNull(goal.maxDurationSeconds)
-  goal.tokenBudget = positiveIntegerOrNull(goal.tokenBudget)
-  goal.usageTrackers = normalizeUsageTrackers(goal.usageTrackers)
-  goal.noProgressTokenThreshold = positiveIntegerOrNull(goal.noProgressTokenThreshold) ?? DEFAULT_NO_PROGRESS_TOKEN_THRESHOLD
-  goal.maxNoProgressTurns = positiveIntegerOrNull(goal.maxNoProgressTurns) ?? DEFAULT_MAX_NO_PROGRESS_TURNS
-  goal.budgetWrapupSent = goal.budgetWrapupSent === true
-  goal.stopReason ??= null
-  return goal
+function normalizeProject(project: Project) {
+  project.phase = isPhase(project.phase) ? project.phase : "awaitingApproval"
+  project.milestones = (project.milestones ?? []).map(normalizeMilestone)
+  project.activeMilestoneIndex = nonNegativeIntegerOrNull(project.activeMilestoneIndex) ?? -1
+  project.artifacts = project.artifacts ?? null
+  project.workingDirectory = project.workingDirectory ?? null
+  project.tokenBudget = positiveIntegerOrNull(project.tokenBudget)
+  project.tokensUsed = nonNegativeInteger(project.tokensUsed, 0)
+  project.usageTrackers = normalizeUsageTrackers(project.usageTrackers)
+  project.timeUsedSeconds = nonNegativeInteger(project.timeUsedSeconds, 0)
+  project.sessionsSpawned = nonNegativeInteger(project.sessionsSpawned, 0)
+  project.maxAutoTurns = positiveIntegerOrNull(project.maxAutoTurns)
+  project.maxDurationSeconds = positiveIntegerOrNull(project.maxDurationSeconds)
+  project.maxParallelWorkers =
+    positiveIntegerOrNull(project.maxParallelWorkers) ?? DEFAULT_MAX_PARALLEL_WORKERS
+  project.maxVerificationRetries =
+    nonNegativeIntegerOrNull(project.maxVerificationRetries) ?? DEFAULT_MAX_VERIFICATION_RETRIES
+  project.planPaused = project.planPaused === true
+  project.history = (project.history ?? []).slice(-MAX_HISTORY_ENTRIES)
+  project.completionEvidence = project.completionEvidence ?? null
+  project.blocker = project.blocker ?? null
+  project.closedAt = project.closedAt ?? null
+  project.stopReason = project.stopReason ?? null
+  project.lastStatus = project.lastStatus ?? null
+  return project
+}
+
+function normalizeMilestone(milestone: Milestone): Milestone {
+  milestone.tracks = (milestone.tracks ?? []).map(normalizeTrack)
+  milestone.verificationAttempts = nonNegativeInteger(milestone.verificationAttempts, 0)
+  return milestone
+}
+
+function normalizeTrack(track: Track): Track {
+  track.assignedFiles = track.assignedFiles ?? []
+  track.sessionID = track.sessionID ?? null
+  track.attempt = nonNegativeInteger(track.attempt, 0)
+  track.lastReport = track.lastReport ?? null
+  return track
 }
 
 function normalizeUsageTrackers(trackers: Record<string, UsageTracker> | undefined) {
@@ -599,52 +636,6 @@ function normalizeUsageTrackers(trackers: Record<string, UsageTracker> | undefin
   return normalized
 }
 
-function normalizePendingAttempt(attempt: PendingAttempt | null | undefined): PendingAttempt | null {
-  if (!attempt || typeof attempt !== "object") return null
-  return {
-    id: typeof attempt.id === "string" && attempt.id ? attempt.id : randomId(),
-    reservedAt:
-      typeof attempt.reservedAt === "number" && Number.isFinite(attempt.reservedAt) ? attempt.reservedAt : Date.now(),
-    started: attempt.started === true,
-    delivered: attempt.delivered === true,
-    committed: attempt.committed === true,
-    armNoProgress: attempt.armNoProgress !== false,
-    previousLastContinuationAt:
-      typeof attempt.previousLastContinuationAt === "number" && Number.isFinite(attempt.previousLastContinuationAt)
-        ? attempt.previousLastContinuationAt
-        : null,
-  }
-}
-
-function randomId() {
-  return `att_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 10)}`
-}
-
-function normalizeCreateOptions(input?: number | null | CreateGoalOptions): Required<CreateGoalOptions> {
-  if (typeof input === "number" || input === null) {
-    return {
-      tokenBudget: positiveIntegerOrNull(input),
-      maxAutoTurns: null,
-      maxDurationSeconds: null,
-      noProgressTokenThreshold: DEFAULT_NO_PROGRESS_TOKEN_THRESHOLD,
-      maxNoProgressTurns: DEFAULT_MAX_NO_PROGRESS_TURNS,
-      agent: null,
-      initialStatus: "active",
-      maxObjectiveChars: DEFAULT_MAX_OBJECTIVE_CHARS,
-    }
-  }
-  return {
-    tokenBudget: positiveIntegerOrNull(input?.tokenBudget),
-    maxAutoTurns: positiveIntegerOrNull(input?.maxAutoTurns),
-    maxDurationSeconds: positiveIntegerOrNull(input?.maxDurationSeconds),
-    noProgressTokenThreshold: positiveIntegerOrNull(input?.noProgressTokenThreshold) ?? DEFAULT_NO_PROGRESS_TOKEN_THRESHOLD,
-    maxNoProgressTurns: positiveIntegerOrNull(input?.maxNoProgressTurns) ?? DEFAULT_MAX_NO_PROGRESS_TURNS,
-    agent: typeof input?.agent === "string" && input.agent.trim() ? input.agent.trim() : null,
-    initialStatus: input?.initialStatus === "paused" ? "paused" : "active",
-    maxObjectiveChars: resolveMaxObjectiveChars(input?.maxObjectiveChars),
-  }
-}
-
 function positiveIntegerOrNull(value: unknown) {
   return typeof value === "number" && Number.isSafeInteger(value) && value > 0 ? value : null
 }
@@ -657,728 +648,30 @@ function nonNegativeIntegerOrNull(value: unknown) {
   return typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : null
 }
 
-function isClosed(status: GoalStatus) {
-  return status === "complete" || status === "unmet"
+const PHASES: Phase[] = [
+  "interview",
+  "awaitingApproval",
+  "executing",
+  "paused",
+  "budgetLimited",
+  "complete",
+  "cancelled",
+]
+
+function isPhase(value: unknown): value is Phase {
+  return typeof value === "string" && (PHASES as string[]).includes(value)
 }
 
-function canContinue(status: GoalStatus) {
-  return status === "active"
+function isClosed(phase: Phase) {
+  return phase === "complete" || phase === "cancelled"
 }
 
-function remainingTokens(goal: Goal) {
-  return goal.tokenBudget == null ? null : Math.max(0, goal.tokenBudget - goal.tokensUsed)
+function isExecuting(phase: Phase) {
+  return phase === "executing"
 }
 
-export function snapshot(goal: Goal): GoalSnapshot {
-  normalizeGoal(goal)
-  const sampledAt = nowSeconds()
-  const activeSeconds =
-    goal.status === "active" && goal.lastAccountedAt != null ? Math.max(0, sampledAt - goal.lastAccountedAt) : 0
-  const timeUsedSeconds = goal.timeUsedSeconds + activeSeconds
-  return {
-    sessionID: goal.sessionID,
-    objective: goal.objective,
-    status: goal.status,
-    tokenBudget: goal.tokenBudget,
-    tokensUsed: goal.tokensUsed,
-    timeUsedSeconds,
-    createdAt: goal.createdAt,
-    updatedAt: goal.updatedAt,
-    completionEvidence: goal.completionEvidence ?? null,
-    blocker: goal.blocker ?? null,
-    closedAt: goal.closedAt ?? null,
-    continuationFailures: goal.continuationFailures,
-    lastStatus: goal.lastStatus,
-    maxAutoTurns: goal.maxAutoTurns,
-    maxDurationSeconds: goal.maxDurationSeconds,
-    noProgressTokenThreshold: goal.noProgressTokenThreshold,
-    maxNoProgressTurns: goal.maxNoProgressTurns,
-    noProgressTurns: goal.noProgressTurns,
-    budgetWrapupSent: goal.budgetWrapupSent,
-    stopReason: goal.stopReason,
-    history: goal.history,
-    checkpoints: goal.checkpoints,
-    lastCheckpoint: goal.lastCheckpoint,
-    lastAssistantText: goal.lastAssistantText,
-    lastAssistantMessageID: goal.lastAssistantMessageID,
-    lastPromptAgent: goal.lastPromptAgent,
-    awaitingContinuationProgress: goal.awaitingContinuationProgress,
-    continuationBaselineMessageID: goal.continuationBaselineMessageID,
-    continuationBaselineSummary: goal.continuationBaselineSummary,
-    autoTurns: goal.autoTurns,
-    lastContinuationAt: goal.lastContinuationAt,
-    remainingTokens: remainingTokens(goal),
-    sampledAt,
-  }
-}
-
-export function snapshotInternal(goal: Goal): InternalGoalSnapshot {
-  return { ...snapshot(goal), pendingAttempt: goal.pendingAttempt }
-}
-
-export async function getGoal(sessionID: string) {
-  const state = await readState()
-  const goal = state.goals[sessionID]
-  return goal ? snapshot(goal) : null
-}
-
-export async function getAllGoals() {
-  const state = await readState()
-  const sorted = Object.values(state.goals).sort(
-    (left, right) =>
-      right.updatedAt - left.updatedAt || (left.sessionID < right.sessionID ? -1 : left.sessionID > right.sessionID ? 1 : 0),
-  )
-  const goals = sorted.slice(0, MAX_LISTED_GOALS).map(goalListItem)
-  return { goals, total: sorted.length, truncated: sorted.length > goals.length }
-}
-
-function goalListItem(goal: Goal): GoalListItem {
-  return {
-    sessionID: goal.sessionID,
-    objective: goal.objective,
-    status: goal.status,
-    tokenBudget: goal.tokenBudget,
-    tokensUsed: goal.tokensUsed,
-    timeUsedSeconds: goal.timeUsedSeconds,
-    createdAt: goal.createdAt,
-    updatedAt: goal.updatedAt,
-    closedAt: goal.closedAt ?? null,
-    maxAutoTurns: goal.maxAutoTurns,
-    maxDurationSeconds: goal.maxDurationSeconds,
-    autoTurns: goal.autoTurns,
-    stopReason: goal.stopReason,
-    remainingTokens: remainingTokens(goal),
-  }
-}
-
-export async function getGoalInternal(sessionID: string) {
-  const state = await readState()
-  const goal = state.goals[sessionID]
-  return goal ? snapshotInternal(goal) : null
-}
-
-export function getGoalSync(sessionID: string) {
-  const state = readStateSync()
-  const goal = state.goals[sessionID]
-  return goal ? snapshot(goal) : null
-}
-
-export async function createGoal(sessionID: string, objective: string, options?: number | null | CreateGoalOptions) {
-  const normalizedOptions = normalizeCreateOptions(options)
-  const value = validateObjective(objective, resolveMaxObjectiveChars(normalizedOptions.maxObjectiveChars))
-  return mutate((state) => {
-    const existing = state.goals[sessionID]
-    if (existing && !isClosed(existing.status)) {
-      throw new Error("cannot create a new goal because this session already has a non-closed goal")
-    }
-    const now = nowSeconds()
-    const paused = normalizedOptions.initialStatus === "paused"
-    const goal: Goal = {
-      sessionID,
-      objective: value,
-      status: normalizedOptions.initialStatus,
-      tokenBudget: normalizedOptions.tokenBudget,
-      tokensUsed: 0,
-      usageTrackers: {},
-      timeUsedSeconds: 0,
-      createdAt: now,
-      updatedAt: now,
-      completionEvidence: null,
-      blocker: paused ? PLAN_MODE_BLOCKER : null,
-      closedAt: null,
-      lastAccountedAt: paused ? null : now,
-      autoTurns: 0,
-      lastContinuationAt: null,
-      continuationFailures: 0,
-      pendingAttempt: null,
-      lastStatus: paused ? "Goal recorded from Plan mode; execution paused until resumed from Build mode." : "Goal set.",
-      maxAutoTurns: normalizedOptions.maxAutoTurns,
-      maxDurationSeconds: normalizedOptions.maxDurationSeconds,
-      noProgressTokenThreshold: normalizedOptions.noProgressTokenThreshold,
-      maxNoProgressTurns: normalizedOptions.maxNoProgressTurns,
-      noProgressTurns: 0,
-      budgetWrapupSent: false,
-      stopReason: paused ? PLAN_MODE_STOP_REASON : null,
-      history: [],
-      checkpoints: [],
-      lastCheckpoint: null,
-      lastAssistantText: "",
-      lastAssistantMessageID: "",
-      lastPromptAgent: normalizedOptions.agent,
-      awaitingContinuationProgress: false,
-      continuationBaselineMessageID: "",
-      continuationBaselineSummary: "",
-    }
-    pushHistory(goal, "created", goalLimitSummary(goal))
-    if (paused) pushHistory(goal, "paused", goal.lastStatus)
-    state.goals[sessionID] = goal
-    return snapshot(goal)
-  })
-}
-
-export async function updateGoalObjective(
-  sessionID: string,
-  objective: string,
-  status: MutableGoalStatus = "active",
-  options?: { agent?: string | null; planModePause?: boolean; maxObjectiveChars?: number },
-) {
-  const value = validateObjective(objective, resolveMaxObjectiveChars(options?.maxObjectiveChars))
-  const agent = typeof options?.agent === "string" && options.agent.trim() ? options.agent.trim() : null
-  const planModePause = options?.planModePause === true
-  return mutate((state) => {
-    const goal = state.goals[sessionID]
-    if (!goal) throw new Error("cannot update goal because this session has no goal")
-    accountWallClock(goal)
-    goal.objective = value
-    goal.status = planModePause ? "paused" : status
-    goal.updatedAt = nowSeconds()
-    goal.lastAccountedAt = goal.status === "active" ? goal.updatedAt : null
-    goal.completionEvidence = null
-    goal.blocker = planModePause ? PLAN_MODE_BLOCKER : null
-    goal.closedAt = null
-    goal.stopReason = planModePause ? PLAN_MODE_STOP_REASON : null
-    goal.budgetWrapupSent = false
-    if (goal.status === "active") {
-      goal.continuationFailures = 0
-      goal.pendingAttempt = null
-      goal.awaitingContinuationProgress = false
-    }
-    if (agent) goal.lastPromptAgent = agent
-    goal.lastStatus = planModePause
-      ? "Goal objective updated; execution paused while the session is in Plan mode."
-      : goal.status === "active"
-        ? "Goal objective updated and resumed."
-        : "Goal objective updated and paused."
-    pushHistory(goal, "updated", `Goal objective updated: ${summarizeText(value, 400)}`)
-    if (planModePause) pushHistory(goal, "paused", goal.lastStatus)
-    return snapshot(goal)
-  })
-}
-
-export async function recordPromptAgent(sessionID: string, agent: string) {
-  const value = agent.trim()
-  if (!value) return null
-  return mutate((state) => {
-    const goal = state.goals[sessionID]
-    if (!goal || isClosed(goal.status)) return goal ? snapshot(goal) : null
-    if (goal.lastPromptAgent === value) return snapshot(goal)
-    goal.lastPromptAgent = value
-    goal.updatedAt = nowSeconds()
-    return snapshot(goal)
-  })
-}
-
-export async function pauseGoalForPlanMode(sessionID: string) {
-  return mutate((state) => {
-    const goal = state.goals[sessionID]
-    if (!goal || goal.status !== "active") return goal ? snapshot(goal) : null
-    accountWallClock(goal)
-    goal.status = "paused"
-    goal.lastAccountedAt = null
-    goal.stopReason = PLAN_MODE_STOP_REASON
-    goal.blocker = PLAN_MODE_BLOCKER
-    goal.lastStatus = "Auto-continue paused while the session is in Plan mode."
-    goal.updatedAt = nowSeconds()
-    pushHistory(goal, "paused", goal.lastStatus)
-    return snapshot(goal)
-  })
-}
-
-export async function setGoalStatus(
-  sessionID: string,
-  status: MutableGoalStatus,
-  agent?: string | null,
-  options?: { resetAutoTurnLimit?: boolean },
-) {
-  const agentValue = typeof agent === "string" && agent.trim() ? agent.trim() : null
-  return mutate((state) => {
-    const goal = state.goals[sessionID]
-    if (!goal) throw new Error("cannot update goal because this session has no goal")
-    if (isClosed(goal.status)) throw new Error("cannot update goal status because this goal is closed")
-    if (goal.status === status) return snapshot(goal)
-    if (status === "paused" && goal.status !== "active") return snapshot(goal)
-    const resumesAutoTurnLimit =
-      options?.resetAutoTurnLimit === true &&
-      status === "active" &&
-      goal.status === "usageLimited" &&
-      goal.stopReason?.startsWith(MAX_AUTO_CONTINUES_STOP_REASON_PREFIX) === true
-    accountWallClock(goal)
-    goal.status = status
-    goal.updatedAt = nowSeconds()
-    goal.lastAccountedAt = status === "active" ? goal.updatedAt : null
-    goal.autoTurns = resumesAutoTurnLimit ? 0 : goal.autoTurns
-    goal.continuationFailures = status === "active" ? 0 : goal.continuationFailures
-    goal.pendingAttempt = status === "active" ? null : goal.pendingAttempt
-    goal.noProgressTurns = status === "active" ? 0 : goal.noProgressTurns
-    goal.stopReason = status === "active" ? null : "paused"
-    goal.budgetWrapupSent = status === "active" ? false : goal.budgetWrapupSent
-    goal.blocker = status === "active" ? null : goal.blocker
-    if (agentValue) goal.lastPromptAgent = agentValue
-    goal.lastStatus = status === "active" ? "Goal resumed." : "Goal paused."
-    pushHistory(goal, status === "active" ? "resumed" : "paused", goal.lastStatus)
-    return snapshot(goal)
-  })
-}
-
-export async function closeGoal(
-  sessionID: string,
-  input:
-    | {
-        status: "complete"
-        evidence: string
-      }
-    | {
-        status: "unmet"
-        blocker: string
-      },
-  maxObjectiveChars = DEFAULT_MAX_OBJECTIVE_CHARS,
-) {
-  const limit = resolveMaxObjectiveChars(maxObjectiveChars)
-  return mutate((state) => {
-    const goal = state.goals[sessionID]
-    if (!goal) throw new Error("cannot update goal because this session has no goal")
-    accountWallClock(goal)
-    const now = nowSeconds()
-    goal.status = input.status
-    goal.updatedAt = now
-    goal.closedAt = now
-    goal.lastAccountedAt = null
-    goal.stopReason = input.status === "complete" ? null : "blocked"
-    if (input.status === "complete") {
-      goal.completionEvidence = validateEvidence(input.evidence, "completion evidence", limit)
-      goal.blocker = null
-      goal.lastStatus = "Goal completed."
-      pushHistory(goal, "completed", goal.completionEvidence)
-    } else {
-      goal.blocker = validateEvidence(input.blocker, "blocker", limit)
-      goal.completionEvidence = null
-      goal.lastStatus = "Goal marked unmet."
-      pushHistory(goal, "unmet", goal.blocker)
-    }
-    return snapshot(goal)
-  })
-}
-
-export async function completeGoal(sessionID: string, evidence: string, maxObjectiveChars = DEFAULT_MAX_OBJECTIVE_CHARS) {
-  return closeGoal(sessionID, { status: "complete", evidence }, maxObjectiveChars)
-}
-
-export async function markGoalUnmet(sessionID: string, blocker: string, maxObjectiveChars = DEFAULT_MAX_OBJECTIVE_CHARS) {
-  return closeGoal(sessionID, { status: "unmet", blocker }, maxObjectiveChars)
-}
-
-export async function clearGoal(sessionID: string) {
-  return mutate((state) => {
-    const existed = Boolean(state.goals[sessionID])
-    delete state.goals[sessionID]
-    return existed
-  })
-}
-
-export async function accountUsage(
-  sessionID: string,
-  tokensUsed?: number,
-  options?: { cumulative?: boolean; source?: string; initialBaseline?: number },
-) {
-  return mutate((state) => {
-    const goal = state.goals[sessionID]
-    if (!goal) return null
-    accountWallClock(goal)
-    if (typeof tokensUsed === "number" && Number.isFinite(tokensUsed)) {
-      const observed = Math.max(0, Math.ceil(tokensUsed))
-      if (options?.cumulative === true) {
-        const source = options.source?.trim() || "default"
-        let tracker = goal.usageTrackers[source]
-        if (!tracker) {
-          const initialBaseline = nonNegativeIntegerOrNull(options.initialBaseline)
-          tracker =
-            initialBaseline != null && initialBaseline <= observed
-              ? {
-                  baseline: initialBaseline,
-                  lastObserved: observed,
-                  baseTokens: goal.tokensUsed,
-                  pendingBaseline: null,
-                  pendingBaseTokens: null,
-                }
-              : {
-                  baseline: observed,
-                  lastObserved: observed,
-                  baseTokens: goal.tokensUsed,
-                  pendingBaseline: null,
-                  pendingBaseTokens: null,
-                }
-          goal.usageTrackers[source] = tracker
-        } else if (observed < tracker.lastObserved) {
-          const initialBaseline = nonNegativeIntegerOrNull(options.initialBaseline)
-          if (initialBaseline != null && initialBaseline <= observed) {
-            tracker = {
-              baseline: initialBaseline,
-              lastObserved: observed,
-              baseTokens: goal.tokensUsed,
-              pendingBaseline: null,
-              pendingBaseTokens: null,
-            }
-            goal.usageTrackers[source] = tracker
-          } else if (tracker.pendingBaseline == null || observed < tracker.pendingBaseline) {
-            // Require a second consistent low observation before treating an
-            // un-signaled decrease as compaction rather than a partial sample.
-            tracker.pendingBaseline = observed
-            tracker.pendingBaseTokens = goal.tokensUsed
-          } else {
-            tracker = {
-              baseline: tracker.pendingBaseline,
-              lastObserved: observed,
-              baseTokens: tracker.pendingBaseTokens ?? goal.tokensUsed,
-              pendingBaseline: null,
-              pendingBaseTokens: null,
-            }
-            goal.usageTrackers[source] = tracker
-          }
-        } else {
-          tracker.lastObserved = observed
-          tracker.pendingBaseline = null
-          tracker.pendingBaseTokens = null
-        }
-        goal.tokensUsed = Math.max(goal.tokensUsed, tracker.baseTokens + observed - tracker.baseline)
-      } else {
-        goal.tokensUsed = Math.max(goal.tokensUsed, observed)
-      }
-    }
-    maybeStopForBudget(goal)
-    goal.updatedAt = nowSeconds()
-    return snapshot(goal)
-  })
-}
-
-export async function recordAssistantProgress(sessionID: string, input: AssistantProgressInput) {
-  return mutate((state) => {
-    const goal = state.goals[sessionID]
-    if (!goal || goal.status !== "active") return goal ? snapshot(goal) : null
-
-    const text = input.text?.trim() ?? ""
-    const messageID = input.messageID?.trim() ?? ""
-    const outputTokens = positiveIntegerOrNull(input.outputTokens) ?? 0
-    const threshold = positiveIntegerOrNull(input.noProgressTokenThreshold) ?? goal.noProgressTokenThreshold
-    const maxNoProgressTurns = positiveIntegerOrNull(input.maxNoProgressTurns) ?? goal.maxNoProgressTurns
-    const summary = summarizeText(text)
-    const substantive = /[\p{L}\p{N}]/u.test(text)
-    const previousSummary = summarizeText(goal.lastAssistantText)
-    const repeatedMessage = Boolean(messageID && messageID === goal.lastAssistantMessageID)
-    const changed = Boolean(summary && summary !== previousSummary)
-
-    if (summary && (!repeatedMessage || changed)) recordCheckpoint(goal, summary)
-    if (text) goal.lastAssistantText = text
-    if (messageID) goal.lastAssistantMessageID = messageID
-
-    // Substantive assistant text proves the continuation transport is healthy,
-    // so a pending continuation is resolved and any accumulated prompt failures
-    // are cleared. Delivery of a prompt alone never resets the counter.
-    if (substantive && summary && (!repeatedMessage || changed)) {
-      // Correlate the progress to the current attempt: delayed output that
-      // completed before this attempt was reserved belongs to a prior turn and
-      // must not clear a newer pending attempt. Guarded by the attempt's
-      // reservedAt anchor (ms). Without a timestamp we resolve conservatively.
-      const attempt = goal.pendingAttempt
-      if (attempt == null || input.completedAt == null || input.completedAt >= attempt.reservedAt) {
-        goal.continuationFailures = 0
-        goal.pendingAttempt = null
-      }
-    }
-
-    // No-progress accounting is scoped to goal continuation turns: it only runs
-    // once per reserved continuation, when the completed turn is observed at the
-    // next idle. Generic observation paths (messages.transform, message.updated)
-    // record checkpoints above but never touch the counter.
-    const attemptForCompletion = goal.pendingAttempt
-    const continuationTurnCompleted =
-      input.evaluateContinuation === true &&
-      goal.awaitingContinuationProgress &&
-      Boolean(messageID) &&
-      messageID !== goal.continuationBaselineMessageID &&
-      // The turn must belong to (complete at/after) the current attempt; a
-      // delayed prior-turn message must not consume the evaluation.
-      (input.completedAt == null || attemptForCompletion == null || input.completedAt >= attemptForCompletion.reservedAt)
-    if (continuationTurnCompleted) {
-      goal.awaitingContinuationProgress = false
-      goal.pendingAttempt = null
-      const lowOutput = outputTokens > 0 && outputTokens < (threshold ?? DEFAULT_NO_PROGRESS_TOKEN_THRESHOLD)
-      const changedSinceContinuation = Boolean(summary && summary !== goal.continuationBaselineSummary)
-      if (lowOutput && !changedSinceContinuation) {
-        goal.noProgressTurns += 1
-        if (maxNoProgressTurns && goal.noProgressTurns >= maxNoProgressTurns) {
-          accountWallClock(goal)
-          goal.status = "paused"
-          goal.lastAccountedAt = null
-          goal.stopReason = "no progress"
-          goal.blocker = `Auto-continue paused after ${goal.noProgressTurns} low-progress continuation turn(s). Resume the goal to retry.`
-          goal.lastStatus = goal.blocker
-          pushHistory(goal, "warning", goal.blocker)
-        } else {
-          goal.lastStatus = `Low-progress continuation turn detected (${goal.noProgressTurns}/${maxNoProgressTurns ?? "unbounded"}).`
-          pushHistory(goal, "warning", goal.lastStatus)
-        }
-      } else {
-        goal.noProgressTurns = 0
-      }
-    }
-
-    goal.updatedAt = nowSeconds()
-    return snapshot(goal)
-  })
-}
-
-/**
- * Persist the next automatic continuation attempt BEFORE the prompt is
- * delivered so that a racing session.status "busy" can correlate to this exact
- * attempt. The autoTurn and lastContinuationAt are committed immediately here
- * (the attempt is a reserved turn); if the attempt is later canceled before it
- * is actually sent, callers must roll it back with rollbackContinuationAttempt.
- */
-export async function reserveContinuation(sessionID: string, maxAutoTurns: number, minIntervalSeconds: number) {
-  return mutate((state) => {
-    const goal = state.goals[sessionID]
-    if (!goal) return null
-    if (goal.status === "budgetLimited" || goal.status === "usageLimited") return reserveWrapup(goal)
-    if (!canContinue(goal.status)) return null
-    const now = nowSeconds()
-    accountWallClock(goal, now)
-    if (maybeStopForUsageLimit(goal, maxAutoTurns, now)) return reserveWrapup(goal)
-    if (goal.lastContinuationAt && now - goal.lastContinuationAt < minIntervalSeconds) return null
-    goal.autoTurns += 1
-    const previousLastContinuationAt = goal.lastContinuationAt
-    goal.lastContinuationAt = now
-    // The baseline is captured at reservation time, but the no-progress
-    // evaluation is only armed once recordContinuationResult confirms the
-    // continuation prompt was actually delivered.
-    goal.continuationBaselineMessageID = goal.lastAssistantMessageID
-    goal.continuationBaselineSummary = summarizeText(goal.lastAssistantText)
-    goal.pendingAttempt = {
-      id: randomId(),
-      reservedAt: Date.now(),
-      started: false,
-      delivered: false,
-      committed: true,
-      armNoProgress: true,
-      previousLastContinuationAt,
-    }
-    goal.awaitingContinuationProgress = false
-    goal.lastStatus = `Auto-continue ${goal.autoTurns} reserved.`
-    pushHistory(goal, "autoContinue", goal.lastStatus)
-    goal.updatedAt = now
-    return snapshotInternal(goal)
-  })
-}
-
-/**
- * Roll back a reserved-but-not-delivered attempt: it must not consume an
- * autoTurn or lastContinuationAt because it was canceled before the prompt was
- * actually sent (e.g. a native retry, a dispose, or a plan/task deferral that
- * short-circuited before delivery). Returns true if a committed attempt was
- * rolled back.
- */
-export async function rollbackContinuationAttempt(sessionID: string) {
-  return mutate((state) => {
-    const goal = state.goals[sessionID]
-    if (!goal) return false
-    const attempt = goal.pendingAttempt
-    if (!attempt || attempt.delivered || !attempt.committed) {
-      if (attempt && !attempt.delivered) goal.pendingAttempt = null
-      return false
-    }
-    goal.autoTurns = Math.max(0, goal.autoTurns - 1)
-    goal.lastContinuationAt = attempt.previousLastContinuationAt
-    goal.pendingAttempt = null
-    goal.awaitingContinuationProgress = false
-    goal.lastStatus = "Auto-continue attempt canceled before delivery."
-    goal.updatedAt = nowSeconds()
-    return true
-  })
-}
-
-export async function recordContinuationResult(
-  sessionID: string,
-  result: "success" | "failure",
-  maxFailures: number,
-  options?: { armNoProgress?: boolean; started?: boolean; requirePending?: boolean },
-) {
-  return mutate((state) => {
-    const goal = state.goals[sessionID]
-    if (!goal || isClosed(goal.status)) return goal ? snapshotInternal(goal) : null
-    const now = nowSeconds()
-    goal.updatedAt = now
-    if (result === "success") {
-      // Successful delivery commits the reserved attempt (it was armed before
-      // delivery so a racing busy already correlated to it). Delivery alone is
-      // not "started": a session.status busy event marks it started through
-      // markPendingContinuationStarted. Watchdog rescues deliver while already
-      // busy and pass started: true.
-      if (goal.status === "active") {
-        const attempt = goal.pendingAttempt
-        if (attempt) {
-          attempt.delivered = true
-          // Preserve a started flag set by a busy that raced the delivery.
-          attempt.started = attempt.started || options?.started === true
-          attempt.armNoProgress = options?.armNoProgress ?? attempt.armNoProgress
-          if (attempt.armNoProgress) goal.awaitingContinuationProgress = true
-        } else {
-          // No reserved attempt (a watchdog rescue or a direct success call):
-          // arm a delivered untracked attempt so the pending window still
-          // works. It consumed no autoTurn (committed: false), so rollback
-          // treats it as unconsumed.
-          goal.pendingAttempt = {
-            id: randomId(),
-            reservedAt: Date.now(),
-            started: options?.started === true,
-            delivered: true,
-            committed: false,
-            armNoProgress: options?.armNoProgress !== false,
-            previousLastContinuationAt: goal.lastContinuationAt,
-          }
-          if (goal.pendingAttempt.armNoProgress) goal.awaitingContinuationProgress = true
-        }
-        goal.lastStatus = "Auto-continue prompt sent."
-      }
-      return snapshotInternal(goal)
-    }
-    // Failure: only transport / unresolved no-response attempts count toward the
-    // ceiling. requirePending ensures a failure without a pending attempt (e.g.
-    // a stray duplicate transport event) is not double-counted.
-    if (options?.requirePending && goal.pendingAttempt == null) return null
-    goal.continuationFailures += 1
-    goal.awaitingContinuationProgress = false
-    goal.pendingAttempt = null
-    goal.lastStatus = `Auto-continue failed ${goal.continuationFailures} time(s).`
-    pushHistory(goal, "error", goal.lastStatus)
-    if (goal.continuationFailures >= maxFailures) {
-      accountWallClock(goal, now)
-      goal.status = "paused"
-      goal.lastAccountedAt = null
-      goal.stopReason = "auto-continue failures"
-      goal.lastStatus = `Paused after ${goal.continuationFailures} auto-continue failure(s).`
-      goal.blocker = "Auto-continue prompt failed repeatedly. Resume the goal to retry."
-      pushHistory(goal, "paused", goal.lastStatus)
-    }
-    return snapshotInternal(goal)
-  })
-}
-
-export async function markPendingContinuationStarted(sessionID: string) {
-  // Fast-path read: only a busy event for an active goal with an unstarted
-  // pending attempt warrants a state write. Goal-less or already-started busy
-  // events must not create or rewrite the state file.
-  const state = await readState()
-  const current = state.goals[sessionID]
-  if (!current || current.status !== "active") return current ? snapshotInternal(current) : null
-  if (current.pendingAttempt == null || current.pendingAttempt.started) return snapshotInternal(current)
-  return mutate((state) => {
-    const goal = state.goals[sessionID]
-    if (!goal || goal.status !== "active") return goal ? snapshotInternal(goal) : null
-    if (goal.pendingAttempt == null || goal.pendingAttempt.started) return snapshotInternal(goal)
-    goal.pendingAttempt.started = true
-    goal.updatedAt = nowSeconds()
-    return snapshotInternal(goal)
-  })
-}
-
-/**
- * Record successful tool output as progress. The optional `expectedAttemptID`
- * is the pending-attempt id captured when the tool call started: when it is
- * provided (a string, or `null` when no attempt was pending then), a currently
- * pending attempt is only cleared when it matches, so delayed output from an
- * earlier turn can never clear a newer pending attempt. Omitting the argument
- * keeps the legacy unconditional reset for direct callers.
- */
-export async function recordToolProgress(sessionID: string, text?: string, expectedAttemptID?: string | null) {
-  return mutate((state) => {
-    const goal = state.goals[sessionID]
-    if (!goal || goal.status !== "active") return goal ? snapshotInternal(goal) : null
-    const value = text?.trim() ?? ""
-    if (!value) return snapshotInternal(goal)
-    if (goal.continuationFailures === 0 && goal.pendingAttempt == null) return snapshotInternal(goal)
-    // A tool call that started before the current attempt was reserved may
-    // finish while a newer attempt is pending. Its output belongs to the prior
-    // turn, so it must not clear the newer attempt: only clear when the
-    // captured attempt matches, or when nothing is pending to protect.
-    if (goal.pendingAttempt != null && expectedAttemptID !== undefined && expectedAttemptID !== goal.pendingAttempt.id) {
-      return snapshotInternal(goal)
-    }
-    // A successful tool output is real progress for the transport: it resolves
-    // any pending continuation and clears the prompt-failure counter. It MUST
-    // NOT touch the continuation no-progress evaluation (awaitingContinuationProgress
-    // and noProgressTurns): a tool call that runs during a continuation turn
-    // must not reset the low-output accounting that the assistant's final text
-    // still needs to drive. Failed tool outputs never reach this reset.
-    goal.continuationFailures = 0
-    goal.pendingAttempt = null
-    goal.updatedAt = nowSeconds()
-    return snapshotInternal(goal)
-  })
-}
-
-function reserveWrapup(goal: Goal): InternalGoalSnapshot | null {
-  if (goal.budgetWrapupSent) return null
-  goal.budgetWrapupSent = true
-  goal.updatedAt = nowSeconds()
-  pushHistory(goal, "limited", `${goal.status}: ${goal.stopReason ?? "goal limit reached"}; requested final handoff.`)
-  return snapshotInternal(goal)
-}
-
-function maybeStopForBudget(goal: Goal) {
-  if (goal.status !== "active") return
-  if (goal.tokenBudget == null || goal.tokensUsed < goal.tokenBudget) return
-  accountWallClock(goal)
-  goal.status = "budgetLimited"
-  goal.lastAccountedAt = null
-  goal.stopReason = `token budget reached (${goal.tokensUsed}/${goal.tokenBudget})`
-  goal.lastStatus = `${goal.stopReason}; wrap-up required.`
-  pushHistory(goal, "limited", goal.lastStatus)
-}
-
-function maybeStopForUsageLimit(goal: Goal, defaultMaxAutoTurns: number, now = nowSeconds()) {
-  if (goal.status !== "active") return false
-  const effectiveMaxAutoTurns = goal.maxAutoTurns ?? defaultMaxAutoTurns
-  if (effectiveMaxAutoTurns > 0 && goal.autoTurns >= effectiveMaxAutoTurns) {
-    goal.status = "usageLimited"
-    goal.lastAccountedAt = null
-    goal.stopReason = `${MAX_AUTO_CONTINUES_STOP_REASON_PREFIX}${effectiveMaxAutoTurns})`
-    goal.lastStatus = `${goal.stopReason}; wrap-up required.`
-    pushHistory(goal, "limited", goal.lastStatus)
-    return true
-  }
-  if (goal.maxDurationSeconds != null && goal.timeUsedSeconds >= goal.maxDurationSeconds) {
-    goal.status = "usageLimited"
-    goal.lastAccountedAt = null
-    goal.stopReason = `max duration reached (${goal.maxDurationSeconds}s)`
-    goal.lastStatus = `${goal.stopReason}; wrap-up required.`
-    pushHistory(goal, "limited", goal.lastStatus)
-    goal.updatedAt = now
-    return true
-  }
-  return false
-}
-
-function accountWallClock(goal: Goal, now = nowSeconds()) {
-  if (goal.status !== "active") return
-  if (goal.lastAccountedAt == null) {
-    goal.lastAccountedAt = now
-    return
-  }
-  goal.timeUsedSeconds += Math.max(0, now - goal.lastAccountedAt)
-  goal.lastAccountedAt = now
-}
-
-function recordCheckpoint(goal: Goal, summary: string) {
-  const checkpoint = { summary: summarizeText(summary), timestamp: nowSeconds() }
-  if (!checkpoint.summary || goal.lastCheckpoint?.summary === checkpoint.summary) return
-  goal.lastCheckpoint = checkpoint
-  goal.checkpoints = [...goal.checkpoints, checkpoint].slice(-MAX_CHECKPOINTS)
-  pushHistory(goal, "checkpoint", checkpoint.summary)
-}
-
-function pushHistory(goal: Goal, type: GoalHistoryType, detail: string | null | undefined) {
-  const value = summarizeText(detail ?? "", 400)
-  if (!value) return
-  goal.history = [...goal.history, { type, detail: value, timestamp: nowSeconds() }].slice(-MAX_HISTORY_ENTRIES)
+function remainingTokens(project: Project) {
+  return project.tokenBudget == null ? null : Math.max(0, project.tokenBudget - project.tokensUsed)
 }
 
 function summarizeText(text: string, limit = CHECKPOINT_CHAR_LIMIT) {
@@ -1387,41 +680,764 @@ function summarizeText(text: string, limit = CHECKPOINT_CHAR_LIMIT) {
   return normalized.length > limit ? `${normalized.slice(0, limit - 1)}...` : normalized
 }
 
-function goalLimitSummary(goal: Goal) {
-  const limits = [
-    goal.tokenBudget == null ? null : `${goal.tokenBudget} token budget`,
-    goal.maxAutoTurns == null ? null : `${goal.maxAutoTurns} auto-continue limit`,
-    goal.maxDurationSeconds == null ? null : `${goal.maxDurationSeconds}s duration limit`,
-  ].filter(Boolean)
-  return limits.length ? `Goal set with ${limits.join(", ")}.` : "Goal set with default continuation limits."
+function pushHistory(project: Project, type: ProjectHistoryType, detail: string | null | undefined) {
+  const value = summarizeText(detail ?? "", 400)
+  if (!value) return
+  project.history = [...project.history, { type, detail: value, timestamp: nowSeconds() }].slice(-MAX_HISTORY_ENTRIES)
+}
+
+function accountWallClock(project: Project, now = nowSeconds()) {
+  if (!isExecuting(project.phase)) return
+  if (project.lastAccountedAt == null) {
+    project.lastAccountedAt = now
+    return
+  }
+  project.timeUsedSeconds += Math.max(0, now - project.lastAccountedAt)
+  project.lastAccountedAt = now
+}
+
+function maybeStopForBudget(project: Project) {
+  if (!isExecuting(project.phase)) return false
+  if (project.tokenBudget == null || project.tokensUsed < project.tokenBudget) return false
+  accountWallClock(project)
+  project.phase = "budgetLimited"
+  project.lastAccountedAt = null
+  project.stopReason = `token budget reached (${project.tokensUsed}/${project.tokenBudget})`
+  project.lastStatus = `${project.stopReason}; wrap-up required.`
+  pushHistory(project, "limited", project.lastStatus)
+  return true
+}
+
+function maybeStopForUsageLimit(project: Project, now = nowSeconds()) {
+  if (!isExecuting(project.phase)) return false
+  if (project.maxAutoTurns != null && project.sessionsSpawned >= project.maxAutoTurns) {
+    accountWallClock(project)
+    project.phase = "budgetLimited"
+    project.lastAccountedAt = null
+    project.stopReason = `max team sessions reached (${project.maxAutoTurns})`
+    project.lastStatus = `${project.stopReason}; wrap-up required.`
+    pushHistory(project, "limited", project.lastStatus)
+    project.updatedAt = now
+    return true
+  }
+  if (project.maxDurationSeconds != null && project.timeUsedSeconds >= project.maxDurationSeconds) {
+    accountWallClock(project)
+    project.phase = "budgetLimited"
+    project.lastAccountedAt = null
+    project.stopReason = `max duration reached (${project.maxDurationSeconds}s)`
+    project.lastStatus = `${project.stopReason}; wrap-up required.`
+    pushHistory(project, "limited", project.lastStatus)
+    project.updatedAt = now
+    return true
+  }
+  return false
+}
+
+// ---------------------------------------------------------------------------
+// Snapshots
+// ---------------------------------------------------------------------------
+
+export type ProjectSnapshot = Project & {
+  remainingTokens: number | null
+  sampledAt: number
+}
+
+export type TrackLocation = {
+  projectSessionID: string
+  milestoneIndex: number
+  trackID: string
+  role: TeamRole
+  trackStatus: TrackStatus
+}
+
+export function snapshot(project: Project): ProjectSnapshot {
+  normalizeProject(project)
+  const sampledAt = nowSeconds()
+  const activeSeconds =
+    isExecuting(project.phase) && project.lastAccountedAt != null
+      ? Math.max(0, sampledAt - project.lastAccountedAt)
+      : 0
+  return {
+    ...project,
+    timeUsedSeconds: project.timeUsedSeconds + activeSeconds,
+    remainingTokens: remainingTokens(project),
+    sampledAt,
+  }
+}
+
+export function findTrackBySession(project: Project, roleSessionID: string): TrackLocation | null {
+  for (let milestoneIndex = 0; milestoneIndex < project.milestones.length; milestoneIndex += 1) {
+    const milestone = project.milestones[milestoneIndex]!
+    for (const track of milestone.tracks) {
+      if (track.sessionID === roleSessionID) {
+        return {
+          projectSessionID: project.sessionID,
+          milestoneIndex,
+          trackID: track.id,
+          role: track.role,
+          trackStatus: track.status,
+        }
+      }
+    }
+  }
+  return null
+}
+
+/** Finds the project that owns a role session (or that is the main session). */
+export async function locateProjectByRoleSession(roleSessionID: string) {
+  const state = await readState()
+  for (const project of Object.values(state.projects)) {
+    if (project.sessionID === roleSessionID) {
+      return { snapshot: snapshot(project), location: null }
+    }
+    const location = findTrackBySession(project, roleSessionID)
+    if (location) return { snapshot: snapshot(project), location }
+  }
+  return null
+}
+
+// ---------------------------------------------------------------------------
+// Public API
+// ---------------------------------------------------------------------------
+
+const MAX_TEXT_CHARS = 100_000
+const MAX_SLUG_LENGTH = 80
+
+function boundedText(value: string, label: string, limit = MAX_TEXT_CHARS) {
+  if (typeof value !== "string") throw new Error(`${label} must be a string`)
+  const trimmed = value.trim()
+  if (!trimmed) throw new Error(`${label} must not be empty`)
+  if ([...trimmed].length > limit) throw new Error(`${label} must be at most ${limit} characters`)
+  return trimmed
+}
+
+export function normalizeSlug(name: string) {
+  const slug = name
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9\u4e00-\u9fff]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, MAX_SLUG_LENGTH)
+    .replace(/-+$/g, "")
+  if (!slug) throw new Error("project name must contain usable characters (letters, digits, or CJK)")
+  return slug
+}
+
+export async function getProject(sessionID: string) {
+  const state = await readState()
+  const project = state.projects[sessionID]
+  return project ? snapshot(project) : null
+}
+
+export function getProjectSync(sessionID: string) {
+  const state = readStateSync()
+  const project = state.projects[sessionID]
+  return project ? snapshot(project) : null
+}
+
+export async function getAllProjects() {
+  const state = await readState()
+  return Object.values(state.projects)
+    .sort((left, right) => right.updatedAt - left.updatedAt)
+    .map(snapshot)
+}
+
+/** Commits the Phase 1 brief as a project awaiting approval. */
+export async function createProject(
+  sessionID: string,
+  brief: Brief,
+  options?: CreateProjectOptions,
+  agent?: string | null,
+) {
+  const normalizedBrief: Brief = {
+    name: normalizeSlug(boundedText(brief.name, "project name", 200)),
+    objectives: boundedText(brief.objectives, "project objectives"),
+    requirements: boundedText(brief.requirements, "project requirements"),
+    verification: boundedText(brief.verification, "project verification"),
+    acceptanceCriteria: boundedText(brief.acceptanceCriteria, "acceptance criteria"),
+    integrityMode: brief.integrityMode,
+    artifactLocale: brief.artifactLocale,
+  }
+  const workingDirectory =
+    typeof options?.workingDirectory === "string" && options.workingDirectory.trim()
+      ? options.workingDirectory.trim()
+      : null
+  return mutate((state) => {
+    const existing = state.projects[sessionID]
+    if (existing && !isClosed(existing.phase) && existing.phase !== "interview") {
+      throw new Error("cannot create a new project because this session already has a non-closed project")
+    }
+    const now = nowSeconds()
+    const project: Project = {
+      sessionID,
+      slug: normalizedBrief.name,
+      brief: normalizedBrief,
+      phase: "awaitingApproval",
+      milestones: [],
+      activeMilestoneIndex: -1,
+      artifacts: null,
+      workingDirectory,
+      tokenBudget: positiveIntegerOrNull(options?.tokenBudget),
+      tokensUsed: 0,
+      usageTrackers: {},
+      timeUsedSeconds: 0,
+      lastAccountedAt: null,
+      sessionsSpawned: 0,
+      maxAutoTurns: positiveIntegerOrNull(options?.maxAutoTurns),
+      maxDurationSeconds: positiveIntegerOrNull(options?.maxDurationSeconds),
+      maxParallelWorkers:
+        positiveIntegerOrNull(options?.maxParallelWorkers) ?? DEFAULT_MAX_PARALLEL_WORKERS,
+      maxVerificationRetries:
+        nonNegativeIntegerOrNull(options?.maxVerificationRetries) ?? DEFAULT_MAX_VERIFICATION_RETRIES,
+      planPaused: false,
+      sentinelUpdate: null,
+      history: [],
+      completionEvidence: null,
+      blocker: null,
+      closedAt: null,
+      stopReason: null,
+      lastStatus: "Project created from the scoping interview; awaiting approval.",
+      createdAt: now,
+      updatedAt: now,
+    }
+    pushHistory(project, "created", `Project "${project.slug}" created; awaiting approval.`)
+    pushHistory(project, "artifact", "Prompt artifact committed from the Phase 1 interview.")
+    if (agent) {
+      // agent is recorded through the server's own hooks; nothing to persist here.
+    }
+    state.projects[sessionID] = project
+    return snapshot(project)
+  })
+}
+
+/** Replaces the brief while still awaiting approval (after /teamwork-revise). */
+export async function updateProjectBrief(sessionID: string, brief: Brief) {
+  const normalizedBrief: Brief = {
+    name: normalizeSlug(boundedText(brief.name, "project name", 200)),
+    objectives: boundedText(brief.objectives, "project objectives"),
+    requirements: boundedText(brief.requirements, "project requirements"),
+    verification: boundedText(brief.verification, "project verification"),
+    acceptanceCriteria: boundedText(brief.acceptanceCriteria, "acceptance criteria"),
+    integrityMode: brief.integrityMode,
+    artifactLocale: brief.artifactLocale,
+  }
+  return mutate((state) => {
+    const project = state.projects[sessionID]
+    if (!project) throw new Error("cannot revise the project because this session has no project")
+    if (isClosed(project.phase)) throw new Error("cannot revise the project because it is closed")
+    if (project.phase !== "awaitingApproval") {
+      throw new Error("the project brief can only be revised while awaiting approval")
+    }
+    project.brief = normalizedBrief
+    project.slug = normalizedBrief.name
+    project.updatedAt = nowSeconds()
+    project.lastStatus = "Project brief revised; awaiting approval."
+    pushHistory(project, "updated", `Project brief revised for "${project.slug}".`)
+    return snapshot(project)
+  })
+}
+
+export async function setProjectArtifacts(
+  sessionID: string,
+  artifacts: { request: string; plan: string; progress: string },
+) {
+  return mutate((state) => {
+    const project = state.projects[sessionID]
+    if (!project) throw new Error("cannot record artifacts because this session has no project")
+    project.artifacts = artifacts
+    project.updatedAt = nowSeconds()
+    return snapshot(project)
+  })
+}
+
+/** Approves the project: awaitingApproval -> executing. */
+export async function approveProject(sessionID: string, options?: { planPaused?: boolean }) {
+  return mutate((state) => {
+    const project = state.projects[sessionID]
+    if (!project) throw new Error("cannot approve because this session has no project")
+    if (isClosed(project.phase)) throw new Error("cannot approve because this project is closed")
+    if (project.phase !== "awaitingApproval") {
+      throw new Error("the project is not awaiting approval")
+    }
+    const now = nowSeconds()
+    project.phase = "executing"
+    project.planPaused = options?.planPaused === true
+    project.lastAccountedAt = project.planPaused ? null : now
+    project.lastStatus = project.planPaused
+      ? "Project approved; execution paused until the session leaves Plan mode."
+      : "Project approved; the team is starting."
+    project.updatedAt = now
+    pushHistory(project, "approved", project.lastStatus)
+    if (project.planPaused) pushHistory(project, "paused", project.lastStatus)
+    return snapshot(project)
+  })
+}
+
+/** Resumes from paused or plan-paused states back to executing. */
+export async function resumeProject(sessionID: string) {
+  return mutate((state) => {
+    const project = state.projects[sessionID]
+    if (!project) throw new Error("cannot resume because this session has no project")
+    if (isClosed(project.phase)) throw new Error("cannot resume because this project is closed")
+    if (project.phase !== "paused") {
+      throw new Error("the project is not paused")
+    }
+    const now = nowSeconds()
+    project.phase = "executing"
+    project.planPaused = false
+    project.lastAccountedAt = now
+    project.stopReason = null
+    project.blocker = null
+    project.lastStatus = "Project resumed; the team continues."
+    project.updatedAt = now
+    pushHistory(project, "resumed", project.lastStatus)
+    return snapshot(project)
+  })
+}
+
+/** Pauses the project from executing; records the reason. */
+export async function pauseProject(sessionID: string, reason: string | null | undefined, options?: {
+  planPaused?: boolean
+  stopReason?: string | null
+  blocker?: string | null
+  historyType?: ProjectHistoryType
+}) {
+  return mutate((state) => {
+    const project = state.projects[sessionID]
+    if (!project) throw new Error("cannot pause because this session has no project")
+    if (project.phase !== "executing" && project.phase !== "budgetLimited") {
+      throw new Error("the project is not executing")
+    }
+    const now = nowSeconds()
+    accountWallClock(project, now)
+    project.phase = "paused"
+    project.lastAccountedAt = null
+    project.stopReason = options?.stopReason ?? (reason?.trim() ? reason.trim() : "paused")
+    project.blocker = options?.blocker ?? (summarizeText(reason ?? "", 400) || null)
+    project.planPaused = options?.planPaused === true
+    project.lastStatus = summarizeText(reason ?? "Project paused.", 400)
+    project.updatedAt = now
+    pushHistory(project, options?.historyType ?? "paused", project.lastStatus)
+    return snapshot(project)
+  })
+}
+
+/** Marks the plan-paused flag while executing (session entered Plan mode). */
+export async function markProjectPlanPaused(sessionID: string, planPaused: boolean) {
+  return mutate((state) => {
+    const project = state.projects[sessionID]
+    if (!project || project.phase !== "executing") return project ? snapshot(project) : null
+    if (project.planPaused === planPaused) return snapshot(project)
+    project.planPaused = planPaused
+    if (planPaused) {
+      project.stopReason = "plan mode"
+      project.blocker =
+        "The team is paused because the session entered Plan mode. Switch to Build mode and resume the project."
+      project.lastStatus = "Team paused while the session is in Plan mode."
+      pushHistory(project, "paused", project.lastStatus)
+    }
+    project.updatedAt = nowSeconds()
+    return snapshot(project)
+  })
+}
+
+export async function cancelProject(sessionID: string, reason?: string | null) {
+  return mutate((state) => {
+    const project = state.projects[sessionID]
+    if (!project) return false
+    if (isClosed(project.phase)) return false
+    const now = nowSeconds()
+    accountWallClock(project, now)
+    project.phase = "cancelled"
+    project.closedAt = now
+    project.lastAccountedAt = null
+    project.blocker = summarizeText(reason ?? "Cancelled by the user.", 400) || null
+    project.stopReason = "cancelled"
+    project.lastStatus = "Project cancelled."
+    project.updatedAt = now
+    pushHistory(project, "cancelled", project.blocker ?? "Cancelled.")
+    return true
+  })
+}
+
+export async function completeProject(sessionID: string, evidence: string) {
+  const value = boundedText(evidence, "completion evidence")
+  return mutate((state) => {
+    const project = state.projects[sessionID]
+    if (!project) throw new Error("cannot complete because this session has no project")
+    if (isClosed(project.phase)) throw new Error("cannot complete because this project is closed")
+    const now = nowSeconds()
+    accountWallClock(project, now)
+    project.phase = "complete"
+    project.closedAt = now
+    project.lastAccountedAt = null
+    project.completionEvidence = value
+    project.blocker = null
+    project.stopReason = null
+    project.lastStatus = "Project completed."
+    project.updatedAt = now
+    pushHistory(project, "completed", value)
+    return snapshot(project)
+  })
+}
+
+/** Records the Orchestrator's milestone plan (Phase 2 kickoff / re-plan). */
+export async function setMilestonePlan(
+  sessionID: string,
+  milestones: Array<Pick<Milestone, "title" | "description"> & { tracks: Array<Pick<Track, "title" | "role" | "assignedFiles">> }>,
+) {
+  return mutate((state) => {
+    const project = state.projects[sessionID]
+    if (!project) throw new Error("cannot record the plan because this session has no project")
+    if (project.phase !== "executing") throw new Error("the plan can only be recorded while executing")
+    if (!Array.isArray(milestones) || milestones.length === 0) {
+      throw new Error("the milestone plan must contain at least one milestone")
+    }
+    const now = nowSeconds()
+    project.milestones = milestones.map((milestone, milestoneIndex) => ({
+      id: `m${milestoneIndex + 1}`,
+      title: boundedText(milestone.title, "milestone title", 500),
+      description: boundedText(milestone.description, "milestone description"),
+      status: "pending",
+      verificationAttempts: 0,
+      tracks: (milestone.tracks ?? []).map((track, trackIndex) => ({
+        id: `m${milestoneIndex + 1}t${trackIndex + 1}`,
+        title: boundedText(track.title, "track title", 500),
+        role: track.role,
+        assignedFiles: Array.isArray(track.assignedFiles) ? track.assignedFiles.map(String) : [],
+        status: "queued",
+        sessionID: null,
+        attempt: 0,
+        lastReport: null,
+      })),
+    }))
+    project.activeMilestoneIndex = 0
+    project.lastStatus = `Milestone plan recorded (${project.milestones.length} milestones).`
+    project.updatedAt = now
+    pushHistory(project, "milestone", project.lastStatus)
+    return snapshot(project)
+  })
+}
+
+/** Registers a role session against a queued track (or an ad-hoc role task). */
+export async function assignTrackSession(
+  projectSessionID: string,
+  milestoneIndex: number,
+  trackID: string,
+  roleSessionID: string,
+) {
+  return mutate((state) => {
+    const project = state.projects[projectSessionID]
+    if (!project) throw new Error("cannot assign a session because the project does not exist")
+    const milestone = project.milestones[milestoneIndex]
+    if (!milestone) throw new Error("cannot assign a session because the milestone does not exist")
+    const track = milestone.tracks.find((candidate) => candidate.id === trackID)
+    if (!track) throw new Error("cannot assign a session because the track does not exist")
+    track.sessionID = roleSessionID
+    track.status = "running"
+    track.attempt += 1
+    track.lastReport = null
+    project.sessionsSpawned += 1
+    project.updatedAt = nowSeconds()
+    maybeStopForUsageLimit(project)
+    return snapshot(project)
+  })
+}
+
+/** Registers an ad-hoc role task that has no plan track (e.g. Orchestrator itself). */
+export async function recordAdhocSession(projectSessionID: string, role: TeamRole, roleSessionID: string) {
+  return mutate((state) => {
+    const project = state.projects[projectSessionID]
+    if (!project) throw new Error("cannot record the session because the project does not exist")
+    const index = project.activeMilestoneIndex >= 0 ? project.activeMilestoneIndex : 0
+    const milestone = project.milestones[index]
+    if (milestone) {
+      milestone.tracks.push({
+        id: `adhoc-${role}-${roleSessionID.slice(0, 8)}`,
+        title: `Ad-hoc ${role} task`,
+        role,
+        assignedFiles: [],
+        status: "running",
+        sessionID: roleSessionID,
+        attempt: 1,
+        lastReport: null,
+      })
+    }
+    project.sessionsSpawned += 1
+    project.updatedAt = nowSeconds()
+    maybeStopForUsageLimit(project)
+    return snapshot(project)
+  })
+}
+
+/** Marks a track's role session as finished without a submitted report. */
+export async function failTrackSession(roleSessionID: string, reason: string) {
+  return mutate((state) => {
+    for (const project of Object.values(state.projects)) {
+      const location = findTrackBySession(project, roleSessionID)
+      if (!location) continue
+      const milestone = project.milestones[location.milestoneIndex]!
+      const track = milestone.tracks.find((candidate) => candidate.id === location.trackID)!
+      track.status = "failed"
+      project.lastStatus = `${track.role} session failed: ${summarizeText(reason, 200)}`
+      project.updatedAt = nowSeconds()
+      pushHistory(project, "error", project.lastStatus)
+      return snapshot(project)
+    }
+    return null
+  })
+}
+
+/** Applies a structured report submitted through the teamwork_report tool. */
+export async function submitTrackReport(roleSessionID: string, report: Omit<RoleReport, "submittedAt">) {
+  const normalizedReport: RoleReport = {
+    role: report.role,
+    verdict: report.verdict,
+    findings: (report.findings ?? []).map((item) => boundedText(item, "report finding", 2000)).slice(0, 50),
+    evidence: (report.evidence ?? []).map((item) => boundedText(item, "report evidence", 2000)).slice(0, 50),
+    blockers: (report.blockers ?? []).map((item) => boundedText(item, "report blocker", 2000)).slice(0, 20),
+    artifactsWritten: (report.artifactsWritten ?? []).map((item) => item.trim()).filter(Boolean).slice(0, 100),
+    submittedAt: nowSeconds(),
+  }
+  return mutate((state) => {
+    for (const project of Object.values(state.projects)) {
+      const location = findTrackBySession(project, roleSessionID)
+      if (!location) continue
+      const milestone = project.milestones[location.milestoneIndex]!
+      const track = milestone.tracks.find((candidate) => candidate.id === location.trackID)!
+      track.lastReport = normalizedReport
+      track.status = normalizedReport.verdict === "pass" ? "passed" : normalizedReport.verdict === "fail" ? "failed" : track.status
+      if (track.status === "passed" && (track.role === "explorer" || track.role === "worker")) {
+        // Implementation/research tracks that pass stay "passed"; verification
+        // roles drive milestone status through the state machine.
+      }
+      project.lastStatus = `${track.role} reported: ${normalizedReport.verdict}`
+      project.updatedAt = nowSeconds()
+      pushHistory(project, "verification", `${track.role} (${milestone.id}) reported ${normalizedReport.verdict}`)
+      return snapshot(project)
+    }
+    return null
+  })
+}
+
+export async function setSentinelUpdate(sessionID: string, message: string) {
+  const value = boundedText(message, "sentinel update", 2000)
+  return mutate((state) => {
+    const project = state.projects[sessionID]
+    if (!project) throw new Error("cannot record the update because this session has no project")
+    project.sentinelUpdate = { message: value, timestamp: nowSeconds() }
+    project.updatedAt = nowSeconds()
+    return snapshot(project)
+  })
+}
+
+export async function setMilestoneStatus(
+  sessionID: string,
+  milestoneIndex: number,
+  status: MilestoneStatus,
+) {
+  return mutate((state) => {
+    const project = state.projects[sessionID]
+    if (!project) throw new Error("cannot update the milestone because this session has no project")
+    const milestone = project.milestones[milestoneIndex]
+    if (!milestone) throw new Error("cannot update the milestone because it does not exist")
+    milestone.status = status
+    if (status === "passed") {
+      project.activeMilestoneIndex = Math.min(milestoneIndex + 1, project.milestones.length - 1)
+      if (milestoneIndex === project.milestones.length - 1) project.activeMilestoneIndex = milestoneIndex
+    }
+    project.updatedAt = nowSeconds()
+    pushHistory(project, "milestone", `${milestone.id} (${milestone.title}) -> ${status}`)
+    return snapshot(project)
+  })
+}
+
+export async function recordVerificationAttempt(sessionID: string, milestoneIndex: number) {
+  return mutate((state) => {
+    const project = state.projects[sessionID]
+    if (!project) throw new Error("cannot record the attempt because this session has no project")
+    const milestone = project.milestones[milestoneIndex]
+    if (!milestone) throw new Error("cannot record the attempt because the milestone does not exist")
+    milestone.verificationAttempts += 1
+    project.updatedAt = nowSeconds()
+    pushHistory(
+      project,
+      "verification",
+      `${milestone.id} verification attempt ${milestone.verificationAttempts}/${project.maxVerificationRetries + 1}`,
+    )
+    return snapshot(project)
+  })
+}
+
+export async function accountProjectUsage(
+  sessionID: string,
+  tokensUsed?: number,
+  options?: { cumulative?: boolean; source?: string; initialBaseline?: number },
+) {
+  return mutate((state) => {
+    const project = state.projects[sessionID]
+    if (!project) return null
+    accountWallClock(project)
+    if (typeof tokensUsed === "number" && Number.isFinite(tokensUsed)) {
+      const observed = Math.max(0, Math.ceil(tokensUsed))
+      if (options?.cumulative === true) {
+        const source = options.source?.trim() || "default"
+        let tracker = project.usageTrackers[source]
+        if (!tracker) {
+          const initialBaseline = nonNegativeIntegerOrNull(options.initialBaseline)
+          tracker = {
+            baseline: initialBaseline != null && initialBaseline <= observed ? initialBaseline : observed,
+            lastObserved: observed,
+            baseTokens: project.tokensUsed,
+            pendingBaseline: null,
+            pendingBaseTokens: null,
+          }
+          project.usageTrackers[source] = tracker
+        } else if (observed < tracker.lastObserved) {
+          const initialBaseline = nonNegativeIntegerOrNull(options.initialBaseline)
+          if (initialBaseline != null && initialBaseline <= observed) {
+            tracker = {
+              baseline: initialBaseline,
+              lastObserved: observed,
+              baseTokens: project.tokensUsed,
+              pendingBaseline: null,
+              pendingBaseTokens: null,
+            }
+            project.usageTrackers[source] = tracker
+          } else if (tracker.pendingBaseline == null || observed < tracker.pendingBaseline) {
+            tracker.pendingBaseline = observed
+            tracker.pendingBaseTokens = project.tokensUsed
+          } else {
+            tracker = {
+              baseline: tracker.pendingBaseline,
+              lastObserved: observed,
+              baseTokens: tracker.pendingBaseTokens ?? project.tokensUsed,
+              pendingBaseline: null,
+              pendingBaseTokens: null,
+            }
+            project.usageTrackers[source] = tracker
+          }
+        } else {
+          tracker.lastObserved = observed
+          tracker.pendingBaseline = null
+          tracker.pendingBaseTokens = null
+        }
+        project.tokensUsed = Math.max(project.tokensUsed, tracker.baseTokens + observed - tracker.baseline)
+      } else {
+        project.tokensUsed = Math.max(project.tokensUsed, observed)
+      }
+    }
+    maybeStopForBudget(project)
+    project.updatedAt = nowSeconds()
+    return snapshot(project)
+  })
+}
+
+/** Usage accounting for a role session, attributed to its owning project. */
+export async function accountRoleSessionUsage(
+  roleSessionID: string,
+  tokensUsed?: number,
+  options?: { cumulative?: boolean; source?: string; initialBaseline?: number },
+) {
+  const state = await readState()
+  for (const project of Object.values(state.projects)) {
+    if (project.sessionID === roleSessionID) {
+      return accountProjectUsage(project.sessionID, tokensUsed, options)
+    }
+  }
+  // Role sessions are located by scanning; a second read inside mutate is
+  // serialized by the mutation queue so this stays consistent.
+  return mutate((state) => {
+    for (const project of Object.values(state.projects)) {
+      if (!findTrackBySession(project, roleSessionID)) continue
+      if (!isExecuting(project.phase)) return snapshot(project)
+      accountWallClock(project)
+      if (typeof tokensUsed === "number" && Number.isFinite(tokensUsed)) {
+        const observed = Math.max(0, Math.ceil(tokensUsed))
+        const source = `${roleSessionID}:${options?.source?.trim() || "default"}`
+        let tracker = project.usageTrackers[source]
+        if (!tracker) {
+          const initialBaseline = nonNegativeIntegerOrNull(options?.initialBaseline)
+          tracker = {
+            baseline: initialBaseline != null && initialBaseline <= observed ? initialBaseline : observed,
+            lastObserved: observed,
+            baseTokens: project.tokensUsed,
+            pendingBaseline: null,
+            pendingBaseTokens: null,
+          }
+          project.usageTrackers[source] = tracker
+        } else if (observed >= tracker.lastObserved) {
+          tracker.lastObserved = observed
+          tracker.pendingBaseline = null
+          tracker.pendingBaseTokens = null
+        }
+        project.tokensUsed = Math.max(project.tokensUsed, tracker.baseTokens + observed - tracker.baseline)
+      }
+      maybeStopForBudget(project)
+      project.updatedAt = nowSeconds()
+      return snapshot(project)
+    }
+    return null
+  })
 }
 
 export function estimateTokensFromText(text: string) {
   return Math.ceil(text.length / 4)
 }
 
-export function formatGoal(goal: GoalSnapshot | null) {
-  if (!goal) return "No goal is set for this session."
+export function formatProject(project: ProjectSnapshot | null) {
+  if (!project) return "No Teamwork project is set for this session."
   const lines = [
-    `Objective: ${goal.objective}`,
-    `Status: ${goal.status}`,
-    `Time used: ${goal.timeUsedSeconds}s`,
-    `Tokens used: ${goal.tokensUsed}${goal.tokenBudget == null ? "" : `/${goal.tokenBudget}`}`,
-    `Auto-continues: ${goal.autoTurns}${goal.maxAutoTurns == null ? "" : `/${goal.maxAutoTurns}`}`,
+    `Project: ${project.slug}`,
+    `Phase: ${project.phase}`,
+    `Integrity mode: ${project.brief.integrityMode}`,
+    `Milestones: ${project.milestones.length}${
+      project.activeMilestoneIndex >= 0 ? ` (active: m${project.activeMilestoneIndex + 1})` : ""
+    }`,
+    `Time used: ${project.timeUsedSeconds}s`,
+    `Tokens used: ${project.tokensUsed}${project.tokenBudget == null ? "" : `/${project.tokenBudget}`}`,
   ]
-  if (goal.remainingTokens != null) lines.push(`Tokens remaining: ${goal.remainingTokens}`)
-  if (goal.maxDurationSeconds != null) lines.push(`Duration limit: ${goal.maxDurationSeconds}s`)
-  if (goal.noProgressTurns > 0) lines.push(`No-progress turns: ${goal.noProgressTurns}`)
-  if (goal.lastCheckpoint) lines.push(`Latest checkpoint: ${goal.lastCheckpoint.summary}`)
-  if (goal.lastStatus) lines.push(`Last status: ${goal.lastStatus}`)
-  if (goal.stopReason) lines.push(`Stop reason: ${goal.stopReason}`)
-  if (goal.completionEvidence) lines.push(`Completion evidence: ${goal.completionEvidence}`)
-  if (goal.blocker) lines.push(`Blocker: ${goal.blocker}`)
+  if (project.remainingTokens != null) lines.push(`Tokens remaining: ${project.remainingTokens}`)
+  if (project.maxDurationSeconds != null) lines.push(`Duration limit: ${project.maxDurationSeconds}s`)
+  if (project.artifacts) {
+    lines.push(`Request artifact: ${project.artifacts.request}`)
+    lines.push(`Plan artifact: ${project.artifacts.plan}`)
+    lines.push(`Progress artifact: ${project.artifacts.progress}`)
+  }
+  if (project.sentinelUpdate) {
+    lines.push(`Latest Sentinel update: ${project.sentinelUpdate.message}`)
+  }
+  if (project.lastStatus) lines.push(`Last status: ${project.lastStatus}`)
+  if (project.stopReason) lines.push(`Stop reason: ${project.stopReason}`)
+  if (project.completionEvidence) lines.push(`Completion evidence: ${project.completionEvidence}`)
+  if (project.blocker) lines.push(`Blocker: ${project.blocker}`)
   return lines.join("\n")
 }
 
-export function formatGoalHistory(goal: GoalSnapshot | null) {
-  if (!goal) return "No goal history is available for this session."
-  if (goal.history.length === 0) return "No goal history recorded yet."
-  return goal.history.map((entry) => `- [${new Date(entry.timestamp * 1000).toISOString()}] ${entry.type}: ${entry.detail}`).join("\n")
+export function formatProjectDetail(project: ProjectSnapshot | null) {
+  if (!project) return "No Teamwork project is set for this session."
+  const lines = [formatProject(project)]
+  if (project.milestones.length > 0) {
+    lines.push("", "Milestones:")
+    project.milestones.forEach((milestone, index) => {
+      lines.push(`- ${milestone.id} [${milestone.status}] ${milestone.title}`)
+      for (const track of milestone.tracks) {
+        const files = track.assignedFiles.length > 0 ? ` files: ${track.assignedFiles.join(", ")}` : ""
+        lines.push(`  - ${track.id} [${track.status}] (${track.role}) ${track.title}${files}`)
+        if (track.lastReport) {
+          lines.push(
+            `    verdict: ${track.lastReport.verdict}; findings: ${track.lastReport.findings.length}; evidence: ${track.lastReport.evidence.length}`,
+          )
+        }
+      }
+      if (index === 4) lines.push("- ... (truncated)")
+    })
+  }
+  if (project.history.length > 0) {
+    lines.push("", "Recent history:")
+    for (const entry of project.history.slice(-8)) {
+      lines.push(`- [${new Date(entry.timestamp * 1000).toISOString()}] ${entry.type}: ${entry.detail}`)
+    }
+  }
+  return lines.join("\n")
 }

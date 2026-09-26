@@ -1,19 +1,96 @@
 // Runs the installed OpenCode V2 binary against a deterministic local model.
-// No real provider credentials, shared service, or user goal state are used.
+// No real provider credentials, shared service, or user project state are used.
+//
+// The fixture model scripts the full /teamwork lifecycle:
+//   /teamwork          -> teamwork_create_project
+//   /teamwork-approve  -> teamwork_approve (the plugin state machine takes over)
+//   orchestrator       -> teamwork_submit_plan
+//   explorer/worker/critic/auditor/successAuditor -> teamwork_report (pass)
+// and the smoke asserts the project reaches phase "complete" with artifacts
+// written on disk.
 import assert from "node:assert/strict"
 import { cp, mkdtemp, mkdir, readFile, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join, resolve } from "node:path"
 import { pathToFileURL } from "node:url"
 
-const root = await mkdtemp(join(tmpdir(), "goal-v2-lifecycle-smoke-"))
+const root = await mkdtemp(join(tmpdir(), "teamwork-v2-smoke-"))
 const project = join(root, "project")
 await mkdir(project)
+// OpenCode resolves project locations through git; a non-git directory falls
+// back to the "global" project and its command/plugin lists come back empty.
+await Bun.spawnSync(["git", "init", "-q", project])
 const target = process.argv[2] ?? "."
 const registryPackage = target.startsWith("@")
 const packagePath = registryPackage ? target : resolve(target)
 let modelCalls = 0
-let continuationCalls = 0
+
+const ROLE_MARKERS: Array<[string, string]> = [
+  ["You are the Project Orchestrator", "orchestrator"],
+  ["You are an Explorer", "explorer"],
+  ["You are a Worker", "worker"],
+  ["You are the Critic", "critic"],
+  ["You are the Challenger", "challenger"],
+  ["You are the Auditor of", "auditor"],
+  ["You are the Success Auditor", "successAuditor"],
+]
+
+function textOf(content: unknown): string {
+  if (typeof content === "string") return content
+  if (Array.isArray(content)) {
+    return content
+      .map((part) => (part && typeof part === "object" && "text" in (part as Record<string, unknown>)
+        ? String((part as Record<string, unknown>).text ?? "")
+        : ""))
+      .join("\n")
+  }
+  return ""
+}
+
+function roleFromMessages(messages: Array<{ role: string; content?: unknown }>): string | null {
+  const system = messages.filter((message) => message.role === "system").map((message) => textOf(message.content)).join("\n")
+  for (const [marker, role] of ROLE_MARKERS) {
+    if (system.includes(marker)) return role
+  }
+  // When the host could not register named agents, the role identity rides
+  // the task prompt (a user message) instead of the system prompt.
+  const user = messages.filter((message) => message.role === "user").map((message) => textOf(message.content)).join("\n")
+  for (const [marker, role] of ROLE_MARKERS) {
+    if (user.includes(marker)) return role
+  }
+  return null
+}
+
+const PLAN = {
+  milestones: [
+    {
+      title: "Survey the codebase",
+      description: "Map the existing REST routes and produce a migration map.",
+      tracks: [{ title: "Route survey", role: "explorer", assigned_files: [] }],
+    },
+    {
+      title: "Port the server to Fastify",
+      description: "Port every handler and pass the full test suite.",
+      tracks: [
+        { title: "Port handlers", role: "worker", assigned_files: ["src/server.ts"] },
+        { title: "Review the port", role: "critic", assigned_files: [] },
+        { title: "Audit the port", role: "auditor", assigned_files: [] },
+      ],
+    },
+  ],
+}
+
+function reportArgs(role: string) {
+  return {
+    role,
+    verdict: "pass",
+    findings: [`The ${role} pass completed its assignment against the request artifact.`],
+    evidence: ["fixture: npm test -> 42 passing"],
+    blockers: [],
+    artifacts_written: [],
+  }
+}
+
 const model = Bun.serve({
   hostname: "127.0.0.1",
   port: 0,
@@ -26,21 +103,48 @@ const model = Bun.serve({
     modelCalls++
     await writeFile(join(root, `model-request-${modelCalls}.json`), JSON.stringify(body))
     const messages = body.messages
-    const last = messages.at(-1)
-    const continuationCount = messages.filter((message) => message.role === "user" &&
-      JSON.stringify(message.content).includes("Continue working toward the active session goal")).length
-    const hasContinuation = continuationCount > 0
-    if (hasContinuation) continuationCalls++
-    const toolName = hasContinuation ? "update_goal" : "create_goal"
-    const tool = body.tools?.find((entry) => entry.function.name === toolName || entry.function.name.endsWith(`_${toolName}`))
-    const call = last?.role === "user" && tool && (!hasContinuation || continuationCount >= 2)
-    const args = hasContinuation
-      ? { status: "complete", evidence: "A native V2 execution settled and the plugin automatically sent the next goal prompt." }
-      : { objective: "Verify native V2 goal continuation with the local fixture model", max_auto_turns: 3 }
-    const delta = call
-      ? { role: "assistant", tool_calls: [{ index: 0, id: `call_${modelCalls}`, type: "function", function: { name: tool.function.name, arguments: JSON.stringify(args) } }] }
-      : { role: "assistant", content: `Isolated fixture milestone ${modelCalls} is verified. The active goal still requires the next automatic continuation turn.` }
-    const finish = call ? "tool_calls" : "stop"
+    const userText = messages
+      .filter((message): message is { role: string; content?: unknown } => message.role === "user")
+      .map((message) => textOf(message.content))
+      .pop() ?? ""
+    const role = roleFromMessages(messages)
+    // When the last message is a tool result the action already ran —
+    // acknowledge with text. Otherwise classify by the newest user prompt.
+    const lastMessage = messages.at(-1)
+    const lastIsToolResult = lastMessage?.role === "tool"
+
+    let toolName: string | null = null
+    let args: unknown = {}
+    if (!lastIsToolResult) {
+      if (role !== null) {
+        toolName = role === "orchestrator" ? "teamwork_submit_plan" : "teamwork_report"
+        args = role === "orchestrator" ? PLAN : reportArgs(role)
+      } else if (userText.includes("You are the Teamwork scoping interviewer")) {
+        toolName = "teamwork_create_project"
+        args = {
+          name: "fastify-migration",
+          objectives: "Migrate the REST API service from Express to Fastify.",
+          requirements: "All existing routes keep their behavior; TypeScript throughout.",
+          verification: "The migrated server must pass the full integration test suite.",
+          acceptance_criteria: "npm test passes with zero failures on the Fastify server.",
+          integrity_mode: "development",
+          artifact_locale: "en",
+        }
+      } else if (userText.includes("teamwork_approve")) {
+        toolName = "teamwork_approve"
+      } else if (userText.includes("teamwork_get_project")) {
+        toolName = "teamwork_get_project"
+      }
+    }
+
+    const tool = toolName ? body.tools?.find((entry) => entry.function.name === toolName) : undefined
+    const delta = tool
+      ? {
+          role: "assistant",
+          tool_calls: [{ index: 0, id: `call_${modelCalls}`, type: "function", function: { name: tool.function.name, arguments: JSON.stringify(args) } }],
+        }
+      : { role: "assistant", content: `Fixture acknowledgment ${modelCalls}: no further tool call needed.` }
+    const finish = tool ? "tool_calls" : "stop"
     const chunk = (choices: unknown[], usage?: unknown) => ({ id: `chatcmpl_${modelCalls}`, object: "chat.completion.chunk", created: Math.floor(Date.now() / 1000), model: "fixture", choices, ...(usage ? { usage } : {}) })
     const usage = { prompt_tokens: 100, completion_tokens: 100, total_tokens: 200 }
     if (!body.stream) {
@@ -57,8 +161,22 @@ const model = Bun.serve({
 
 await mkdir(join(root, "config/opencode"), { recursive: true })
 if (!registryPackage) {
+  // Local plugin files cannot resolve external imports (effect, zod) — there
+  // is no node_modules to walk up to. Build a fully-bundled server (no
+  // externals) for the smoke; npm-installed packages keep their dependencies
+  // and need the normal externalizing build.
+  const standalone = join(root, "standalone")
+  const built = await Bun.build({
+    entrypoints: [join(packagePath, "src/server.ts")],
+    outdir: standalone,
+    target: "bun",
+  })
+  if (!built.success) {
+    console.error(built.logs)
+    throw new Error("Standalone smoke bundle failed")
+  }
   await mkdir(join(root, "config/opencode/plugins"))
-  await writeFile(join(root, "config/opencode/plugins/goal.ts"), `export { default } from ${JSON.stringify(pathToFileURL(join(packagePath, "dist/server.js")).href)}\n`)
+  await writeFile(join(root, "config/opencode/plugins/teamwork.ts"), `export { default } from ${JSON.stringify(pathToFileURL(join(standalone, "server.js")).href)}\n`)
 }
 await writeFile(join(root, "config/opencode/opencode.json"), JSON.stringify({
   model: "fixture/fixture",
@@ -75,17 +193,23 @@ await writeFile(join(root, "config/opencode/opencode.json"), JSON.stringify({
 
 // Use a clean environment, not a spread of process.env (which may carry a live
 // OPENCODE_DB, server connection settings, provider credentials, or config).
-const env = {
+// The cache dir is shared across runs on purpose: opencode installs the
+// provider's npm package on first boot, which alone can take minutes on a
+// cold cache.
+const sharedCache = join(tmpdir(), "opencode-teamwork-smoke-cache")
+await mkdir(sharedCache, { recursive: true })
+const env: Record<string, string> = {
   PATH: process.env.PATH!,
   HOME: join(root, "home"),
   XDG_CONFIG_HOME: join(root, "config"),
   XDG_DATA_HOME: join(root, "data"),
   XDG_STATE_HOME: join(root, "state"),
-  XDG_CACHE_HOME: join(root, "cache"),
+  XDG_CACHE_HOME: sharedCache,
   OPENCODE_DB: join(root, "opencode.db"),
-  OPENCODE_GOAL_STATE_PATH: join(root, "goals.json"),
+  OPENCODE_TEAMWORK_STATE_PATH: join(root, "projects.json"),
   OPENCODE_PASSWORD: crypto.randomUUID(),
   FIXTURE_API_KEY: "local-fixture-only",
+  ...(process.env.OPENCODE_TEAMWORK_TRACE ? { OPENCODE_TEAMWORK_TRACE: process.env.OPENCODE_TEAMWORK_TRACE } : {}),
 }
 const binary = process.env.OPENCODE_V2_BIN ?? "opencode2"
 if (registryPackage) {
@@ -105,20 +229,37 @@ const consume = async (stream: ReadableStream<Uint8Array>) => {
   for await (const chunk of stream) output += new TextDecoder().decode(chunk)
 }
 const readers = Promise.all([consume(child.stdout), consume(child.stderr)])
-const deadline = Date.now() + Number(process.env.OPENCODE_SMOKE_TIMEOUT_MS ?? 30000)
+// Server boot includes a possible first-run provider install (cold cache can
+// take minutes); the lifecycle stages after readiness get the shorter budget.
+const readyDeadline = Date.now() + Number(process.env.OPENCODE_SMOKE_READY_TIMEOUT_MS ?? 300_000)
+const lifecycleDeadlineBase = Date.now() + Number(process.env.OPENCODE_SMOKE_TIMEOUT_MS ?? 300_000)
 let lastStage: string | undefined
 const waitFor = async (stage: string, check: () => boolean | Promise<boolean>, diagnose?: () => string) => {
   lastStage = stage
+  const deadline = stage === "server-ready" ? readyDeadline : lifecycleDeadlineBase
   while (Date.now() < deadline) {
     if (await check()) return
     if (child.exitCode != null) throw new Error(`Private V2 exited: ${output.slice(-4000)}`)
     await Bun.sleep(50)
   }
   const details = diagnose?.()
-  const observed = `modelCalls=${modelCalls}, continuationCalls=${continuationCalls}${details ? `; ${details}` : ""}`
+  const observed = `modelCalls=${modelCalls}${details ? `; ${details}` : ""}`
   throw new Error(`Smoke timeout at stage "${stage}"; ${observed}; logs=${root}/server.log`)
 }
 let passed = false
+// Hard watchdog: never let a stuck server or child process wedge the smoke.
+const watchdog = setTimeout(
+  () => {
+    try {
+      writeFile(join(root, "watchdog-fired.txt"), `stage=${lastStage ?? "unknown"} modelCalls=${modelCalls}`).catch(() => undefined)
+    } catch {
+      // Diagnostics must never mask the watchdog exit.
+    }
+    console.error(`Smoke watchdog fired at stage "${lastStage ?? "unknown"}"`)
+    process.exit(1)
+  },
+  (readyDeadline - Date.now()) + 420_000,
+)
 try {
   await waitFor("server-ready", () => /http:\/\/127\.0\.0\.1:\d+/.test(output))
   const base = output.match(/http:\/\/127\.0\.0\.1:\d+/)![0]
@@ -132,102 +273,105 @@ try {
     const text = await response.text()
     return text ? JSON.parse(text) : undefined
   }
-  const created = await api("/api/session", { location: { directory: project }, title: "Isolated lifecycle smoke", model: { providerID: "fixture", id: "fixture" }, agent: "build" }) as { data: { id: string } }
+  const created = await api("/api/session", { location: { directory: project }, title: "Teamwork lifecycle smoke", model: { providerID: "fixture", id: "fixture" }, agent: "build" }) as { data: { id: string } }
   const sessionID = created.data.id
-  // The user's shared server hosts many locations. Activating a second plugin
-  // instance must not duplicate continuation delivery for the first location.
-  const otherProject = join(root, "other-project")
-  await mkdir(otherProject)
-  await api(`/api/plugin/await-activation?location%5Bdirectory%5D=${encodeURIComponent(otherProject)}`, {})
-  await api(`/api/plugin/await-activation?location%5Bdirectory%5D=${encodeURIComponent(project)}`, {})
-  const plugins = await api(`/api/plugin?location%5Bdirectory%5D=${encodeURIComponent(project)}`) as { data: Array<{ id?: string; state?: { status: string; error?: string } }> }
-  await writeFile(join(root, "plugins.json"), JSON.stringify(plugins))
-  await writeFile(join(root, "config.json"), JSON.stringify(await api(`/api/config?location%5Bdirectory%5D=${encodeURIComponent(project)}`)))
-  assert(plugins.data.some((plugin) => plugin.id === "local.goal-mode.server" && plugin.state?.status === "active"), `Goal plugin did not activate; inspect ${root}/plugins.json`)
+  // Best-effort activation nudge: newer binaries may not expose this endpoint
+  // (404 is fine — loading the project's plugins happens implicitly).
+  const activation = await fetch(`${base}/api/plugin/await-activation?location%5Bdirectory%5D=${encodeURIComponent(project)}`, {
+    method: "POST",
+    headers: { "content-type": "application/json", authorization: `Basic ${btoa(`opencode:${env.OPENCODE_PASSWORD}`)}` },
+    body: "{}",
+  }).catch(() => undefined)
+  if (activation && !activation.ok) await writeFile(join(root, "await-activation.status"), String(activation.status))
+  const plugins = await api(`/api/plugin?location%5Bdirectory%5D=${encodeURIComponent(project)}`).catch(() => undefined) as { data: Array<{ id?: string; state?: { status: string; error?: string } }> } | undefined
+  if (plugins) await writeFile(join(root, "plugins.json"), JSON.stringify(plugins))
+  else await writeFile(join(root, "plugins.json"), "unavailable")
   const commands = await api(`/api/command?location%5Bdirectory%5D=${encodeURIComponent(project)}`) as { data: Array<{ name: string }> }
-  assert(commands.data.some((command) => command.name === "goal"))
+  const wanted = ["teamwork", "teamwork-approve", "teamwork-revise", "teamwork-status", "teamwork-pause", "teamwork-resume", "teamwork-cancel"]
+  // The project-location plugin instance registers its commands asynchronously
+  // after the first session activity; poll instead of asserting immediately.
+  await waitFor("commands-registered", async () => {
+    const current = await api(`/api/command?location%5Bdirectory%5D=${encodeURIComponent(project)}`) as { data: Array<{ name: string }> }
+    return wanted.every((name) => current.data.some((command) => command.name === name))
+  }, () => `commands=${commands.data.map((command) => command.name).join(",") || "none"}`)
+
+  // Phase 1: the scoping interview commits the prompt artifact.
+  const stateFile = env.OPENCODE_TEAMWORK_STATE_PATH!
   await api(`/api/session/${sessionID}/command`, {
-    command: "goal", text: "Create a goal for the fixture milestone. Keep it active until the automatic continuation arrives.",
+    name: "teamwork",
+    text: "Migrate our REST API service from Express to Fastify, including full test coverage.",
   })
-  let state: { goals: Record<string, { status: string; autoTurns: number }> } | undefined
-  // Last-observed values for each final condition, so a timeout can report
-  // which one was stuck instead of failing opaquely.
-  let lastOutcome: string | undefined
-  let lastGoalStatus: string | undefined
-  let lastAutoTurns: number | undefined
-  let lastActiveSessionActive: boolean | undefined
-  await waitFor("goal-complete", async () => {
-    const current = await api(`/api/session/${sessionID}`) as { data: { outcome?: string } }
-    lastOutcome = current.data.outcome
-    if (current.data.outcome === "failed") {
-      const exported = await api(`/api/session/${sessionID}/export`)
-      await writeFile(join(root, "failed-session.json"), JSON.stringify(exported))
-      throw new Error(`Fixture session failed; inspect ${root}/failed-session.json`)
+  await waitFor("project-created", async () => {
+    try {
+      const state = JSON.parse(await readFile(stateFile, "utf8")) as { projects?: Record<string, { phase: string }> }
+      return state.projects?.[sessionID]?.phase === "awaitingApproval"
+    } catch {
+      return false
     }
-    try { state = JSON.parse(await readFile(env.OPENCODE_GOAL_STATE_PATH, "utf8")) } catch { return false }
-    lastGoalStatus = state?.goals[sessionID]?.status
-    lastAutoTurns = state?.goals[sessionID]?.autoTurns
-    if (state?.goals[sessionID]?.status !== "complete") return false
-    const active = await api("/api/session/active") as { data: Record<string, unknown> }
-    lastActiveSessionActive = sessionID in active.data
-    return !lastActiveSessionActive
-  }, () => {
-    const parts = [
-      `goal status=${lastGoalStatus ?? "none"}`,
-      `autoTurns=${lastAutoTurns ?? "none"}`,
-      `outcome=${lastOutcome ?? "unknown"}`,
-      `stillActive=${lastActiveSessionActive ?? "unknown"}`,
-    ]
-    return parts.join(", ")
   })
-  assert.equal(state!.goals[sessionID]!.autoTurns, 2)
-  assert(continuationCalls > 0)
-  const arraysSession = await api("/api/session", {
-    location: { directory: project },
-    title: "Isolated command arrays smoke",
-    model: { providerID: "fixture", id: "fixture" },
-    agent: "build",
-  }) as { data: { id: string } }
-  await api(`/api/session/${arraysSession.data.id}/command`, {
-    command: "goal",
-    text: "Create a goal for the arrays-present command smoke.",
-    files: [],
-    agents: [],
-    skills: [],
+  const requestArtifact = join(project, ".opencode", "teamwork", "fastify-migration", "request.md")
+  await waitFor("request-artifact", async () => {
+    try {
+      const content = await readFile(requestArtifact, "utf8")
+      return content.includes("fastify-migration")
+    } catch {
+      return false
+    }
   })
-  await waitFor("arrays-goal-registered", async () => {
-    try { state = JSON.parse(await readFile(env.OPENCODE_GOAL_STATE_PATH, "utf8")) } catch { return false }
-    return state?.goals[arraysSession.data.id] != null
+
+  // Phase 2: approval hands the project to the plugin state machine, which
+  // drives orchestrator -> explorer/worker -> critic/auditor -> success audit.
+  await api(`/api/session/${sessionID}/command`, {
+    name: "teamwork-approve",
+    text: "",
   })
+  let phase: string | undefined
+  let lastStop: string | undefined
+  await waitFor("project-complete", async () => {
+    try {
+      const state = JSON.parse(await readFile(stateFile, "utf8")) as {
+        projects?: Record<string, { phase: string; stopReason?: string; completionEvidence?: string }>
+      }
+      const current = state.projects?.[sessionID]
+      phase = current?.phase
+      lastStop = current?.stopReason
+      return current?.phase === "complete"
+    } catch {
+      return false
+    }
+  }, () => `phase=${phase ?? "unknown"}, stopReason=${lastStop ?? "none"}`)
+  const finalState = JSON.parse(await readFile(stateFile, "utf8")) as {
+    projects?: Record<string, { completionEvidence?: string; milestones: Array<{ status: string }> }>
+  }
+  const finished = finalState.projects![sessionID]!
+  assert(finished.completionEvidence && finished.completionEvidence.length > 0, "completion evidence missing")
+  assert(finished.milestones.every((milestone) => milestone.status === "passed"), "not every milestone passed")
+  assert(modelCalls >= 8, `too few model calls for the full lifecycle: ${modelCalls}`)
+
   const summary = {
     result: "PASS",
     packagePath,
     sessionID,
     modelCalls,
-    continuationCalls,
-    status: state!.goals[sessionID]!.status,
-    autoTurns: state!.goals[sessionID]!.autoTurns,
+    phase,
+    milestones: finished.milestones.length,
     artifacts: root,
   }
   console.log(JSON.stringify(summary, null, 2))
   passed = true
 } finally {
-  child.kill()
-  await child.exited
-  await readers
-  await writeFile(join(root, "server.log"), output)
-  model.stop(true)
-  // On failure, preserve diagnostics before the temp root disappears: a bare
-  // timeout cannot say which final condition was stuck, and CI uploads the
-  // copied directory as an artifact via OPENCODE_SMOKE_ARTIFACTS_DIR.
+  clearTimeout(watchdog)
+  // Persist diagnostics BEFORE waiting on the child: on Windows a killed
+  // server may not surface its exit promptly, and a hang here must not cost
+  // us the logs.
+  await writeFile(join(root, "server.log"), output).catch(() => undefined)
   if (!passed) {
     try {
       const summary = {
         failed: true,
         stage: lastStage ?? "unknown",
         modelCalls,
-        continuationCalls,
-        deadlineAtMs: deadline,
+        deadlineAtMs: lifecycleDeadlineBase,
         finishedAt: Date.now(),
       }
       await writeFile(join(root, "failure-summary.json"), JSON.stringify(summary))
@@ -241,4 +385,13 @@ try {
       console.error(`Failed to preserve smoke artifacts: ${error instanceof Error ? error.message : String(error)}`)
     }
   }
+  child.kill()
+  await Promise.race([child.exited, new Promise((resolve) => setTimeout(resolve, 2_000))])
+  // On Windows the killed server can survive as a detached tree; force-kill it.
+  if (child.pid) {
+    Bun.spawnSync(["taskkill", "/PID", String(child.pid), "/T", "/F"])
+  }
+  await Promise.race([readers, new Promise((resolve) => setTimeout(resolve, 2_000))]).catch(() => undefined)
+  model.stop(true)
+  process.exit(passed ? 0 : 1)
 }

@@ -1,318 +1,414 @@
-export type GoalLocale = "en" | "zh-CN"
+export type TeamworkLocale = "en" | "zh-TW" | "zh-CN"
 
-type LocaleEnvironment = {
-  LC_ALL?: string
-  LANG?: string
-}
+export type Phase =
+  | "interview"
+  | "awaitingApproval"
+  | "executing"
+  | "paused"
+  | "budgetLimited"
+  | "complete"
+  | "cancelled"
 
-export type GoalMessages = {
+export type IntegrityMode = "development" | "demo" | "benchmark"
+
+export type TeamworkMessages = {
   commands: {
-    goalDescription: string
+    teamworkDescription: string
+    approveDescription: string
+    reviseDescription: string
+    statusDescription: string
     pauseDescription: string
     resumeDescription: string
+    cancelDescription: string
   }
   tools: {
-    getGoal: string
-    getGoalHistory: string
-    listAllGoals: string
-    createGoal: string
-    setGoal: string
-    updateGoalObjective: string
-    updateGoal: string
-    updateGoalStatus: string
-    clearGoal: string
-    objective: string
-    modelObjective: string
-    updatedObjective: string
+    createProject: string
+    submitReport: string
+    getProject: string
+    projectName: string
+    brief: string
+    requirements: string
+    verification: string
+    acceptanceCriteria: string
+    integrityMode: string
+    artifactLocale: string
+    role: string
+    verdict: string
+    findings: string
+    evidence: string
+    blockers: string
+    artifactsWritten: string
     tokenBudget: string
     maxAutoTurns: string
     maxDurationSeconds: string
-    editStatus: string
-    closeStatus: string
-    evidence: string
-    blocker: string
-    activePausedStatus: string
   }
   notices: {
     planModeCreate: string
-    limitedGoal: string
-    duplicateGoal: string
-    conflictingGoal: string
-    restrictedGoal: string
-    cannotResumeInPlan: string
+    duplicateProject: string
+    noProject: string
+    notAwaitingApproval: string
+    notExecuting: string
+    closedProject: string
+    budgetLimitedProject: string
   }
   reports: {
-    achieved: string
-    unmet: string
+    noProject: string
     timeUsed: string
     tokenUsage: string
+    milestone: string
+    integrityMode: string
     evidence: string
     blocker: string
     seconds: string
+    activeTracks: string
+    latestUpdate: string
   }
   tui: {
     title: string
     commandDescription: string
     refresh: string
     refreshDescription: string
-    history: string
-    historyDescription: string
+    status: string
+    statusDescription: string
     pause: string
     pauseDescription: string
     resume: string
     resumeDescription: string
-    clear: string
-    clearDescription: string
+    cancel: string
+    cancelDescription: string
     refreshPrompt: string
-    historyPrompt: string
+    statusPrompt: string
     pausePrompt: string
     resumePrompt: string
-    clearPrompt: string
+    cancelPrompt: string
     openSession: string
-    noGoal: string
-    objective: string
-    status: string
-    timeUsed: string
+    noProject: string
+    project: string
+    phase: string
+    integrity: string
+    milestoneProgress: string
+    tracks: string
     time: string
     tokens: string
-    autoContinues: string
     tokensRemaining: string
-    durationLimit: string
-    noProgressTurns: string
-    latestCheckpoint: string
-    checkpoint: string
-    stopReason: string
-    stop: string
-    lastStatus: string
-    completionEvidence: string
-    blocker: string
-    achieved: string
-    unmet: string
+    latestUpdate: string
+    completed: string
+    cancelled: string
+    paused: string
   }
 }
 
-const EN_MESSAGES: GoalMessages = {
+const EN_MESSAGES: TeamworkMessages = {
   commands: {
-    goalDescription: "Set or view the long-running session goal",
-    pauseDescription: "Pause the current long-running session goal",
-    resumeDescription: "Resume the current long-running session goal",
+    teamworkDescription: "Start a Teamwork project: scoping interview, then an autonomous multi-agent build",
+    approveDescription: "Approve the reviewed prompt artifact and start Phase 2 execution",
+    reviseDescription: "Apply revision instructions to the prompt artifact and wait for approval again",
+    statusDescription: "Show the current Teamwork project status",
+    pauseDescription: "Pause the running Teamwork team",
+    resumeDescription: "Resume the paused Teamwork team",
+    cancelDescription: "Cancel the Teamwork project for this session",
   },
   tools: {
-    getGoal:
-      "Get the current goal for this OpenCode session, including status, observed token usage, elapsed-time usage, " +
-      "budgets, checkpoints, and history.",
-    getGoalHistory: "Get the current goal lifecycle history and recent checkpoints for this OpenCode session.",
-    listAllGoals:
-      "List up to 50 public goal summaries across all sessions in this state file, ordered by most recently updated " +
-      "first. Elapsed time is the last persisted value; total and truncated report omitted older goals.",
-    createGoal:
-      "Create a goal only when explicitly requested by the user or system/developer instructions; do not infer goals " +
-      "from ordinary tasks. If any non-closed goal exists, this returns the existing goal as either reused or " +
-      "conflicting and must not be retried. While the session is in Plan mode, the goal is recorded as paused and " +
-      "execution requires the user to switch to Build mode.",
-    setGoal:
-      "Set a new goal when the user explicitly asks the agent to formulate and set its own goal. The model should " +
-      "write the objective itself based on the user's explicit request. If any non-closed goal exists, this returns " +
-      "the existing goal as either reused or conflicting and must not be retried. While the session is in Plan mode, " +
-      "the goal is recorded as paused and execution requires the user to switch to Build mode.",
-    updateGoalObjective: "Edit the current OpenCode goal objective when the user explicitly asks to edit or replace it.",
-    updateGoal:
-      "Close the existing goal only after an audit against real evidence. Use status complete only when the objective " +
-      "is achieved and no required work remains, and include evidence. Use status unmet only when the objective " +
-      "cannot be achieved or is blocked, and include the blocker. Do not close a goal merely because work is stopping.",
-    updateGoalStatus:
-      "Pause or resume the current OpenCode goal when the user explicitly asks to pause or resume it. Resuming is not " +
-      "allowed while the session is in Plan mode; the user must switch to Build mode first.",
-    clearGoal: "Clear the current OpenCode goal for this session when the user explicitly asks to clear it.",
-    objective: "The concrete objective to start pursuing.",
-    modelObjective: "The model-formulated concrete objective to start pursuing.",
-    updatedObjective: "The updated concrete objective.",
-    tokenBudget: "Optional positive token budget.",
-    maxAutoTurns: "Optional per-goal auto-continue limit.",
-    maxDurationSeconds: "Optional per-goal duration limit.",
-    editStatus: "Whether the edited goal should be active or paused.",
-    closeStatus: "Required. complete means achieved; unmet means blocked or impossible.",
-    evidence: "Required when status is complete. Summarize the concrete evidence verified.",
-    blocker: "Required when status is unmet. Explain the concrete blocker or impossibility.",
-    activePausedStatus: "active resumes a goal; paused pauses it without clearing it.",
+    createProject:
+      "Commit the Phase 1 scoping interview results as a Teamwork project. Call this only after the interview has " +
+      "converged: the user has confirmed objectives, requirements, independent verification, acceptance criteria, " +
+      "the working directory, and an integrity mode. This persists the prompt artifact, records the project state, " +
+      "and returns the artifact paths for the user to review.",
+    submitReport:
+      "Submit the structured final report for the currently assigned teamwork task. Required before the task " +
+      "session ends: a session that finishes without submitting this report is treated as having failed the task.",
+    getProject:
+      "Get the current Teamwork project for this OpenCode session, including phase, integrity mode, milestone " +
+      "progress, active tracks, budgets, and the latest Sentinel update.",
+    projectName: "Short project slug used for the artifact directory (kebab-case).",
+    brief: "Project objectives and scope: what to build, its purpose, and the audience.",
+    requirements: "Requirement blocks covering what the user actually cares about.",
+    verification: "Independent verification method per requirement: test suites, benchmarks, or rubric-judged review.",
+    acceptanceCriteria: "Clear, testable criteria for considering the project complete.",
+    integrityMode: "Verification strictness: development (default), demo, or benchmark.",
+    artifactLocale: "Language for the artifacts: en, zh-TW, or zh-CN.",
+    role: "The reporting role: explorer, worker, critic, challenger, auditor, orchestrator, or successAuditor.",
+    verdict: "The role's verdict: pass, fail, or blocked.",
+    findings: "Concrete findings from this role's pass.",
+    evidence: "Concrete evidence: command output, test results, file references.",
+    blockers: "Anything blocking this task from proceeding.",
+    artifactsWritten: "Paths of files this role created or modified, if any.",
+    tokenBudget: "Optional positive token budget for the whole team (all role sessions combined).",
+    maxAutoTurns: "Optional cap on the number of role sessions the team may spawn.",
+    maxDurationSeconds: "Optional wall-clock limit for the whole project.",
   },
   notices: {
     planModeCreate:
-      "Goal recorded while the session is in Plan mode, so execution is paused. Do not start implementation work " +
-      'now. Ask the user to switch to Build mode and resume the goal (for example with "/goal resume") to begin execution.',
-    limitedGoal:
-      "Safety limit reached. Do not start or continue substantive work for this goal. Summarize useful progress, " +
-      "remaining work, and blockers, then wait for the user to resume or edit the goal.",
-    duplicateGoal:
-      "This non-closed goal already exists. Do not call create_goal or set_goal again. The existing objective and " +
-      "limits were preserved; repeated-call arguments were not applied. Use the returned goal state and continue only " +
-      "when its status permits execution.",
-    conflictingGoal:
-      "A different non-closed goal already exists. Do not call create_goal or set_goal again. Report the conflict " +
-      "instead of replacing the goal; edit, clear, complete, or mark it unmet only when explicitly requested.",
-    restrictedGoal:
-      "Goal execution is not allowed from the current restricted agent or while the goal is paused for Plan mode. " +
-      "Switch to Build mode and resume the goal before doing substantive work.",
-    cannotResumeInPlan:
-      "cannot resume the goal while the session is in Plan mode; ask the user to switch to Build mode and resume the " +
-      "goal from there",
+      "Project recorded while the session is in Plan mode, so execution is paused. Do not start implementation " +
+      "work now. Ask the user to switch to Build mode and resume the project (for example with " +
+      '"/teamwork resume") to begin execution.',
+    duplicateProject:
+      "This non-closed project already exists. Do not call teamwork_create_project again. Review the existing " +
+      "prompt artifact and use /teamwork-revise or /teamwork-approve instead.",
+    noProject:
+      "This session has no Teamwork project. Start one with \"/teamwork <prompt>\" before using this command.",
+    notAwaitingApproval: "The project is not awaiting approval. /teamwork-approve only works after the Phase 1 " +
+      "interview has produced a prompt artifact.",
+    notExecuting: "The project is not currently executing. Pause and resume only apply during Phase 2.",
+    closedProject: "This project is already closed. Start a new project with \"/teamwork <prompt>\".",
+    budgetLimitedProject:
+      "Safety limit reached. Do not start or continue substantive work for this project. Summarize useful " +
+      "progress, remaining work, and blockers, then wait for the user to resume the project.",
   },
   reports: {
-    achieved: "Goal achieved.",
-    unmet: "Goal unmet.",
+    noProject: "No Teamwork project is set for this session.",
     timeUsed: "Time used",
     tokenUsage: "Token usage",
+    milestone: "Milestone",
+    integrityMode: "Integrity mode",
     evidence: "Evidence",
     blocker: "Blocker",
     seconds: "seconds",
+    activeTracks: "Active tracks",
+    latestUpdate: "Latest Sentinel update",
   },
   tui: {
-    title: "Goal",
-    commandDescription: "View, pause, resume, or clear the long-running session goal",
+    title: "Teamwork",
+    commandDescription: "View, pause, resume, or cancel the Teamwork project",
     refresh: "Refresh",
-    refreshDescription: "Ask the agent to read the current goal state",
-    history: "History",
-    historyDescription: "Ask the agent to show lifecycle history",
-    pause: "Pause",
-    pauseDescription: "Pause auto-continuation without clearing",
-    resume: "Resume",
-    resumeDescription: "Resume the goal and continue",
-    clear: "Clear",
-    clearDescription: "Ask the agent to clear this session goal",
-    refreshPrompt: "Call get_goal for this session and report the current goal state briefly.",
-    historyPrompt: "Call get_goal_history for this session and report the current goal history briefly.",
-    pausePrompt: 'Pause the current session goal by calling update_goal_status with status "paused". Report the result briefly.',
-    resumePrompt:
-      'Resume the current session goal by calling update_goal_status with status "active", then continue working toward it.',
-    clearPrompt: "Clear the current session goal by calling clear_goal. Report whether a goal was cleared.",
-    openSession: "Open a session before viewing goal state.",
-    noGoal: "No recent goal state found in this session.",
-    objective: "Objective",
+    refreshDescription: "Ask the agent to read the current project state",
     status: "Status",
-    timeUsed: "Time used",
+    statusDescription: "Ask the agent to show detailed project status",
+    pause: "Pause",
+    pauseDescription: "Pause the running team",
+    resume: "Resume",
+    resumeDescription: "Resume the paused team",
+    cancel: "Cancel",
+    cancelDescription: "Cancel this session's project",
+    refreshPrompt: "Call teamwork_get_project for this session and report the current project state briefly.",
+    statusPrompt: "Call teamwork_get_project for this session and report detailed project status, including all milestones and tracks.",
+    pausePrompt: 'Pause the current session project by calling teamwork_pause. Report the result briefly.',
+    resumePrompt: 'Resume the current session project by calling teamwork_resume, then the team continues autonomously. Report the result briefly.',
+    cancelPrompt: "Cancel the current session project by calling teamwork_cancel. Report whether a project was cancelled.",
+    openSession: "Open a session before viewing project state.",
+    noProject: "No recent Teamwork project state found in this session.",
+    project: "Project",
+    phase: "Phase",
+    integrity: "Integrity",
+    milestoneProgress: "Milestones",
+    tracks: "Active tracks",
     time: "Time",
     tokens: "Tokens",
-    autoContinues: "Auto-continues",
     tokensRemaining: "Tokens remaining",
-    durationLimit: "Duration limit",
-    noProgressTurns: "No-progress turns",
-    latestCheckpoint: "Latest checkpoint",
-    checkpoint: "Checkpoint",
-    stopReason: "Stop reason",
-    stop: "Stop",
-    lastStatus: "Last status",
-    completionEvidence: "Completion evidence",
-    blocker: "Blocker",
-    achieved: "Goal achieved",
-    unmet: "Goal unmet",
+    latestUpdate: "Latest update",
+    completed: "Project completed",
+    cancelled: "Project cancelled",
+    paused: "Project paused",
   },
 }
 
-const ZH_CN_MESSAGES: GoalMessages = {
+const ZH_TW_MESSAGES: TeamworkMessages = {
   commands: {
-    goalDescription: "设置或查看当前会话的长期目标",
-    pauseDescription: "暂停当前会话的长期目标",
-    resumeDescription: "继续当前会话的长期目标",
+    teamworkDescription: "啟動 Teamwork 專案：先進行範疇面談，再由多代理團隊自主執行",
+    approveDescription: "批准已審閱的 prompt artifact，開始第二階段執行",
+    reviseDescription: "將修改指示套用到 prompt artifact，重新等待批准",
+    statusDescription: "顯示目前 Teamwork 專案狀態",
+    pauseDescription: "暫停執行中的 Teamwork 團隊",
+    resumeDescription: "恢復已暫停的 Teamwork 團隊",
+    cancelDescription: "取消此 session 的 Teamwork 專案",
   },
   tools: {
-    getGoal: "获取当前 OpenCode 会话的目标，包括状态、已观察到的 token 使用量、已用时间、预算、检查点和历史记录。",
-    getGoalHistory: "获取当前 OpenCode 会话的目标生命周期历史和最近的检查点。",
-    listAllGoals:
-      "列出此状态文件中所有会话里最近更新的最多 50 个公开目标摘要。已用时间采用最后一次持久化的值；total 和 truncated 字段用于说明是否省略了更早的目标。",
-    createGoal:
-      "仅当用户或 system/developer 指令明确要求时创建目标，不要从普通任务中推断目标。" +
-      "如果已有未关闭目标，则返回该目标并标记为复用或冲突，不得重试。" +
-      "在 Plan 模式下创建目标时，目标会以暂停状态记录；用户切换到 Build 模式后才能执行。",
-    setGoal:
-      "仅当用户明确要求 Agent 自行制定并设置目标时创建新目标。模型应依据用户的明确请求自行撰写目标。" +
-      "如果已有未关闭目标，则返回该目标并标记为复用或冲突，不得重试。" +
-      "在 Plan 模式下创建目标时，目标会以暂停状态记录；用户切换到 Build 模式后才能执行。",
-    updateGoalObjective: "仅当用户明确要求编辑或替换目标时，修改当前 OpenCode 目标的内容。",
-    updateGoal:
-      "只有在依据真实证据完成审计后才能关闭现有目标。仅当目标已经达成且没有剩余必需工作时使用 complete，并提供证据；仅当目标无法达成或被阻塞时使用 unmet，并提供阻塞原因。不要仅因为准备停止工作就关闭目标。",
-    updateGoalStatus:
-      "仅当用户明确要求暂停或继续目标时，暂停或继续当前 OpenCode 目标。在 Plan 模式下不能继续目标；用户必须先切换到 Build 模式。",
-    clearGoal: "仅当用户明确要求清除目标时，清除当前 OpenCode 会话的目标。",
-    objective: "要开始执行的具体目标。",
-    modelObjective: "由模型制定、要开始执行的具体目标。",
-    updatedObjective: "更新后的具体目标。",
-    tokenBudget: "可选的正数 token 预算。",
-    maxAutoTurns: "可选的单目标自动继续次数上限。",
-    maxDurationSeconds: "可选的单目标持续时间上限。",
-    editStatus: "编辑后的目标应处于 active 还是 paused 状态。",
-    closeStatus: "必填。complete 表示已达成；unmet 表示被阻塞或无法完成。",
-    evidence: "status 为 complete 时必填。概述已核验的具体证据。",
-    blocker: "status 为 unmet 时必填。说明具体阻塞原因或无法完成的原因。",
-    activePausedStatus: "active 表示继续目标；paused 表示暂停但不清除目标。",
+    createProject:
+      "將第一階段面談結果提交為 Teamwork 專案。只在面談收斂後呼叫：使用者已確認目標、需求、獨立驗證方式、" +
+      "驗收標準、工作目錄與 integrity mode。此工具會寫入 prompt artifact、記錄專案狀態，並回傳 artifact 路徑供使用者審閱。",
+    submitReport:
+      "提交目前所指派 teamwork 任務的結構化最終報告。必須在任務 session 結束前呼叫：未提交報告就結束的 " +
+      "session 會被視為任務失敗。",
+    getProject:
+      "取得此 OpenCode session 目前的 Teamwork 專案，包括 phase、integrity mode、里程碑進度、活躍 track、" +
+      "預算與最新的 Sentinel 更新。",
+    projectName: "專案簡短代號，用於 artifact 目錄（kebab-case）。",
+    brief: "專案目標與範疇：要建什麼、其目的與受眾。",
+    requirements: "需求區塊，只涵蓋使用者真正在意的內容。",
+    verification: "每項需求的獨立驗證方式：測試套件、效能基準，或依明確 rubric 評審的獨立代理。",
+    acceptanceCriteria: "判定專案完成的明確、可測試的標準。",
+    integrityMode: "驗證嚴格度：development（預設）、demo 或 benchmark。",
+    artifactLocale: "Artifact 語言：en、zh-TW 或 zh-CN。",
+    role: "回報角色：explorer、worker、critic、challenger、auditor、orchestrator 或 successAuditor。",
+    verdict: "該角色的判定：pass、fail 或 blocked。",
+    findings: "該角色審查後的具體發現。",
+    evidence: "具體證據：指令輸出、測試結果、檔案參照。",
+    blockers: "阻礙此任務繼續的事項。",
+    artifactsWritten: "該角色建立或修改的檔案路徑（若有的話）。",
+    tokenBudget: "整個團隊（所有角色 session 合計）的選填 token 預算。",
+    maxAutoTurns: "團隊可建立的角色 session 數量上限（選填）。",
+    maxDurationSeconds: "整個專案的時間上限（選填）。",
   },
   notices: {
     planModeCreate:
-      '目标已在 Plan 模式下记录，因此执行被暂停。现在不要开始实现工作。请让用户切换到 Build 模式并继续目标（例如使用 "/goal resume"）后再开始执行。',
-    limitedGoal:
-      "已达到安全限制。不要开始或继续此目标的实质性工作。请总结已有进展、剩余工作和阻塞项，然后等待用户继续或编辑目标。",
-    duplicateGoal:
-      "这个未关闭目标已经存在。不要再次调用 create_goal 或 set_goal。现有目标内容和限制已保留，重复调用的参数没有应用。请使用返回的目标状态，并且只在其状态允许执行时继续。",
-    conflictingGoal:
-      "已有另一个未关闭目标。不要再次调用 create_goal 或 set_goal，也不要替换现有目标；请报告冲突。只有在用户明确要求时，才可编辑、清除、完成目标或将其标记为 unmet。",
-    restrictedGoal:
-      "当前受限 Agent 或 Plan 模式暂停状态不允许执行目标。请先切换到 Build 模式并继续目标，再进行实质性工作。",
-    cannotResumeInPlan: "会话处于 Plan 模式时不能继续目标；请让用户切换到 Build 模式后再继续该目标",
+      "專案已在 Plan 模式下記錄，因此執行被暫停。現在不要開始實作工作。請讓使用者切換到 Build 模式並恢復專案" +
+      '（例如使用「/teamwork resume」）後再開始執行。',
+    duplicateProject:
+      "這個未關閉的專案已經存在。不要再次呼叫 teamwork_create_project。請審閱現有的 prompt artifact，" +
+      "並改用 /teamwork-revise 或 /teamwork-approve。",
+    noProject: "此 session 沒有 Teamwork 專案。請先用「/teamwork <prompt>」啟動專案。",
+    notAwaitingApproval: "專案目前不在等待批准狀態。/teamwork-approve 只能在第一階段面談產出 prompt artifact 後使用。",
+    notExecuting: "專案目前沒有在執行。暫停與恢復只在第二階段有效。",
+    closedProject: "此專案已關閉。請用「/teamwork <prompt>」啟動新專案。",
+    budgetLimitedProject:
+      "已達到安全限制。不要開始或繼續此專案的實質工作。請總結已有進展、剩餘工作與阻塞項，然後等待使用者恢復專案。",
   },
   reports: {
-    achieved: "目标已达成。",
-    unmet: "目标未达成。",
-    timeUsed: "已用时间",
-    tokenUsage: "Token 使用量",
-    evidence: "证据",
+    noProject: "此 session 沒有設定 Teamwork 專案。",
+    timeUsed: "已用時間",
+    tokenUsage: "Token 用量",
+    milestone: "里程碑",
+    integrityMode: "完整性模式",
+    evidence: "證據",
     blocker: "阻塞原因",
     seconds: "秒",
+    activeTracks: "活躍 track",
+    latestUpdate: "最新 Sentinel 更新",
   },
   tui: {
-    title: "目标",
-    commandDescription: "查看、暂停、继续或清除当前会话的长期目标",
-    refresh: "刷新",
-    refreshDescription: "让 Agent 读取当前目标状态",
-    history: "历史",
-    historyDescription: "让 Agent 显示目标生命周期历史",
-    pause: "暂停",
-    pauseDescription: "暂停自动继续，但不清除目标",
-    resume: "继续",
-    resumeDescription: "继续目标并接着执行",
-    clear: "清除",
-    clearDescription: "让 Agent 清除当前会话目标",
-    refreshPrompt: "调用 get_goal 获取此会话的当前目标，并用简体中文简要报告目标状态。",
-    historyPrompt: "调用 get_goal_history 获取此会话的当前目标历史，并用简体中文简要报告。",
-    pausePrompt: '调用 update_goal_status 并将 status 设为 "paused"，暂停当前会话目标。用简体中文简要报告结果。',
-    resumePrompt:
-      '调用 update_goal_status 并将 status 设为 "active"，继续当前会话目标，然后继续推进该目标。请使用简体中文回复用户。',
-    clearPrompt: "调用 clear_goal 清除当前会话目标，并用简体中文报告是否成功清除了目标。",
-    openSession: "请先打开一个会话，再查看目标状态。",
-    noGoal: "此会话中没有最近的目标状态。",
-    objective: "目标",
-    status: "状态",
-    timeUsed: "已用时间",
-    time: "时间",
+    title: "Teamwork",
+    commandDescription: "查看、暫停、恢復或取消 Teamwork 專案",
+    refresh: "重新整理",
+    refreshDescription: "讓代理讀取目前專案狀態",
+    status: "狀態",
+    statusDescription: "讓代理顯示詳細專案狀態",
+    pause: "暫停",
+    pauseDescription: "暫停執行中的團隊",
+    resume: "恢復",
+    resumeDescription: "恢復已暫停的團隊",
+    cancel: "取消",
+    cancelDescription: "取消此 session 的專案",
+    refreshPrompt: "呼叫 teamwork_get_project 取得此 session 的目前專案，並用繁體中文簡要回報專案狀態。",
+    statusPrompt: "呼叫 teamwork_get_project 取得此 session 的專案，並用繁體中文詳細回報所有里程碑與 track 狀態。",
+    pausePrompt: "呼叫 teamwork_pause 暫停此 session 的專案。用繁體中文簡要回報結果。",
+    resumePrompt: "呼叫 teamwork_resume 恢復此 session 的專案，團隊會自動繼續執行。用繁體中文簡要回報結果。",
+    cancelPrompt: "呼叫 teamwork_cancel 取消此 session 的專案。用繁體中文回報是否成功取消。",
+    openSession: "請先開啟一個 session，再查看專案狀態。",
+    noProject: "此 session 中沒有最近的 Teamwork 專案狀態。",
+    project: "專案",
+    phase: "階段",
+    integrity: "完整性",
+    milestoneProgress: "里程碑",
+    tracks: "活躍 track",
+    time: "時間",
     tokens: "Token",
-    autoContinues: "自动继续次数",
-    tokensRemaining: "剩余 Token",
-    durationLimit: "持续时间上限",
-    noProgressTurns: "无进展轮数",
-    latestCheckpoint: "最新检查点",
-    checkpoint: "检查点",
-    stopReason: "停止原因",
-    stop: "停止",
-    lastStatus: "最近状态",
-    completionEvidence: "完成证据",
-    blocker: "阻塞原因",
-    achieved: "目标已达成",
-    unmet: "目标未达成",
+    tokensRemaining: "剩餘 Token",
+    latestUpdate: "最新更新",
+    completed: "專案已完成",
+    cancelled: "專案已取消",
+    paused: "專案已暫停",
   },
 }
 
-function normalizeLocaleCandidate(value: string | null | undefined): GoalLocale | null {
+const ZH_CN_MESSAGES: TeamworkMessages = {
+  commands: {
+    teamworkDescription: "启动 Teamwork 项目：先进行范畴面谈，再由多智能体团队自主执行",
+    approveDescription: "批准已审阅的 prompt artifact，开始第二阶段执行",
+    reviseDescription: "将修改指示套用到 prompt artifact，重新等待批准",
+    statusDescription: "显示当前 Teamwork 项目状态",
+    pauseDescription: "暂停执行中的 Teamwork 团队",
+    resumeDescription: "恢复已暂停的 Teamwork 团队",
+    cancelDescription: "取消此 session 的 Teamwork 项目",
+  },
+  tools: {
+    createProject:
+      "将第一阶段面谈结果提交为 Teamwork 项目。只在面谈收敛后调用：用户已确认目标、需求、独立验证方式、" +
+      "验收标准、工作目录与 integrity mode。此工具会写入 prompt artifact、记录项目状态，并返回 artifact 路径供用户审阅。",
+    submitReport:
+      "提交当前所指派 teamwork 任务的结构化最终报告。必须在任务 session 结束前调用：未提交报告就结束的 " +
+      "session 会被视为任务失败。",
+    getProject:
+      "获取此 OpenCode session 当前的 Teamwork 项目，包括 phase、integrity mode、里程碑进度、活跃 track、" +
+      "预算与最新的 Sentinel 更新。",
+    projectName: "项目简短代号，用于 artifact 目录（kebab-case）。",
+    brief: "项目目标与范畴：要建什么、其目的与受众。",
+    requirements: "需求区块，只涵盖用户真正在意的内容。",
+    verification: "每项需求的独立验证方式：测试套件、性能基准，或依明确 rubric 评审的独立智能体。",
+    acceptanceCriteria: "判定项目完成的明确、可测试的标准。",
+    integrityMode: "验证严格度：development（默认）、demo 或 benchmark。",
+    artifactLocale: "Artifact 语言：en、zh-TW 或 zh-CN。",
+    role: "回报角色：explorer、worker、critic、challenger、auditor、orchestrator 或 successAuditor。",
+    verdict: "该角色的判定：pass、fail 或 blocked。",
+    findings: "该角色审查后的具体发现。",
+    evidence: "具体证据：命令输出、测试结果、文件参照。",
+    blockers: "阻碍此任务继续的事项。",
+    artifactsWritten: "该角色创建或修改的文件路径（如果有的话）。",
+    tokenBudget: "整个团队（所有角色 session 合计）的选填 token 预算。",
+    maxAutoTurns: "团队可创建的角色 session 数量上限（选填）。",
+    maxDurationSeconds: "整个项目的时间上限（选填）。",
+  },
+  notices: {
+    planModeCreate:
+      "项目已在 Plan 模式下记录，因此执行被暂停。现在不要开始实现工作。请让用户切换到 Build 模式并恢复项目" +
+      "（例如使用「/teamwork resume」）后再开始执行。",
+    duplicateProject:
+      "这个未关闭的项目已经存在。不要再次调用 teamwork_create_project。请审阅现有的 prompt artifact，" +
+      "并改用 /teamwork-revise 或 /teamwork-approve。",
+    noProject: "此 session 没有 Teamwork 项目。请先用「/teamwork <prompt>」启动项目。",
+    notAwaitingApproval: "项目当前不在等待批准状态。/teamwork-approve 只能在第一阶段面谈产出 prompt artifact 后使用。",
+    notExecuting: "项目当前没有在执行。暂停与恢复只在第二阶段有效。",
+    closedProject: "此项目已关闭。请用「/teamwork <prompt>」启动新项目。",
+    budgetLimitedProject:
+      "已达到安全限制。不要开始或继续此项目的实质性工作。请总结已有进展、剩余工作与阻塞项，然后等待用户恢复项目。",
+  },
+  reports: {
+    noProject: "此 session 没有设定 Teamwork 项目。",
+    timeUsed: "已用时间",
+    tokenUsage: "Token 用量",
+    milestone: "里程碑",
+    integrityMode: "完整性模式",
+    evidence: "证据",
+    blocker: "阻塞原因",
+    seconds: "秒",
+    activeTracks: "活跃 track",
+    latestUpdate: "最新 Sentinel 更新",
+  },
+  tui: {
+    title: "Teamwork",
+    commandDescription: "查看、暂停、恢复或取消 Teamwork 项目",
+    refresh: "刷新",
+    refreshDescription: "让智能体读取当前项目状态",
+    status: "状态",
+    statusDescription: "让智能体显示详细项目状态",
+    pause: "暂停",
+    pauseDescription: "暂停执行中的团队",
+    resume: "恢复",
+    resumeDescription: "恢复已暂停的团队",
+    cancel: "取消",
+    cancelDescription: "取消此 session 的项目",
+    refreshPrompt: "调用 teamwork_get_project 获取此 session 的当前项目，并用简体中文简要报告项目状态。",
+    statusPrompt: "调用 teamwork_get_project 获取此 session 的项目，并用简体中文详细报告所有里程碑与 track 状态。",
+    pausePrompt: "调用 teamwork_pause 暂停此 session 的项目。用简体中文简要报告结果。",
+    resumePrompt: "调用 teamwork_resume 恢复此 session 的项目，团队会自动继续执行。用简体中文简要报告结果。",
+    cancelPrompt: "调用 teamwork_cancel 取消此 session 的项目。用简体中文报告是否成功取消。",
+    openSession: "请先打开一个 session，再查看项目状态。",
+    noProject: "此 session 中没有最近的 Teamwork 项目状态。",
+    project: "项目",
+    phase: "阶段",
+    integrity: "完整性",
+    milestoneProgress: "里程碑",
+    tracks: "活跃 track",
+    time: "时间",
+    tokens: "Token",
+    tokensRemaining: "剩余 Token",
+    latestUpdate: "最新更新",
+    completed: "项目已完成",
+    cancelled: "项目已取消",
+    paused: "项目已暂停",
+  },
+}
+
+type LocaleEnvironment = {
+  LC_ALL?: string
+  LANG?: string
+}
+
+function normalizeLocaleCandidate(value: string | null | undefined): TeamworkLocale | null {
   if (!value?.trim()) return null
   const normalized = value.trim().replaceAll("_", "-").split(".")[0]!.split("@")[0]!.toLowerCase()
   if (normalized === "c" || normalized === "posix") return null
+  if (normalized === "zh-tw" || normalized === "zh-hant" || normalized === "zh-hant-tw") return "zh-TW"
+  if (normalized === "zh-hans" || normalized === "zh-hans-cn") return "zh-CN"
   if (normalized === "zh" || normalized.startsWith("zh-")) return "zh-CN"
   if (normalized === "en" || normalized.startsWith("en-")) return "en"
   return null
@@ -338,7 +434,7 @@ export function resolveLocale(
   explicit?: string | null,
   environment: LocaleEnvironment = processEnvironment(),
   osLocale: string | undefined = systemLocale(),
-): GoalLocale {
+): TeamworkLocale {
   const configured = explicit?.trim()
   if (!configured) return "en"
   if (configured.toLowerCase() !== "auto") return normalizeLocaleCandidate(configured) ?? "en"
@@ -350,183 +446,164 @@ export function resolveLocale(
   return "en"
 }
 
-export function messagesFor(locale: GoalLocale): GoalMessages {
-  return locale === "zh-CN" ? ZH_CN_MESSAGES : EN_MESSAGES
+export function isTeamworkLocale(value: string | null | undefined): value is TeamworkLocale {
+  return value === "en" || value === "zh-TW" || value === "zh-CN"
 }
 
-const STATUS_PRESENTATIONS: Record<GoalLocale, Record<string, string>> = {
+export function messagesFor(locale: TeamworkLocale): TeamworkMessages {
+  if (locale === "zh-TW") return ZH_TW_MESSAGES
+  if (locale === "zh-CN") return ZH_CN_MESSAGES
+  return EN_MESSAGES
+}
+
+const PHASE_PRESENTATIONS: Record<TeamworkLocale, Record<Phase, string>> = {
   en: {
-    active: "active",
+    interview: "scoping interview",
+    awaitingApproval: "awaiting approval",
+    executing: "executing",
     paused: "paused",
     budgetLimited: "budget limited",
-    usageLimited: "usage limited",
     complete: "complete",
-    unmet: "unmet",
+    cancelled: "cancelled",
+  },
+  "zh-TW": {
+    interview: "範疇面談中",
+    awaitingApproval: "等待批准",
+    executing: "執行中",
+    paused: "已暫停",
+    budgetLimited: "預算已達上限",
+    complete: "已完成",
+    cancelled: "已取消",
   },
   "zh-CN": {
-    active: "进行中",
+    interview: "范畴面谈中",
+    awaitingApproval: "等待批准",
+    executing: "执行中",
     paused: "已暂停",
     budgetLimited: "预算已达上限",
-    usageLimited: "使用量已达上限",
     complete: "已完成",
-    unmet: "未达成",
+    cancelled: "已取消",
   },
 }
 
-/** Formats protocol status values only at user-facing presentation boundaries. */
-export function presentGoalStatus(status: string, locale: GoalLocale): string {
-  return STATUS_PRESENTATIONS[locale][status] ?? status
+/** Formats protocol phase values only at user-facing presentation boundaries. */
+export function presentPhase(phase: string, locale: TeamworkLocale): string {
+  return PHASE_PRESENTATIONS[locale][phase as Phase] ?? phase
 }
 
-/**
- * Formats stop reasons produced by this plugin. Unknown values are user-authored
- * or externally supplied text and must be returned verbatim.
- */
-export function presentGoalStopReason(reason: string, locale: GoalLocale): string {
-  if (locale !== "zh-CN") return reason
-
-  const direct: Record<string, string> = {
-    paused: "已暂停",
-    blocked: "已阻塞",
-    "plan mode": "Plan 模式",
-    "no progress": "无进展",
-    "auto-continue failures": "自动继续失败",
-    "goal limit reached": "已达到目标限制",
-    "token budget reached": "已达到 Token 预算",
-    "max auto-continues reached": "已达到自动继续次数上限",
-    "max duration reached": "已达到持续时间上限",
-  }
-  if (direct[reason]) return direct[reason]
-
-  const tokenBudget = /^token budget reached \((\d+)\/(\d+)\)$/.exec(reason)
-  if (tokenBudget) return `已达到 Token 预算（${tokenBudget[1]}/${tokenBudget[2]}）`
-  const autoContinues = /^max auto-continues reached \((\d+)\)$/.exec(reason)
-  if (autoContinues) return `已达到自动继续次数上限（${autoContinues[1]}）`
-  const duration = /^max duration reached \((\d+)s\)$/.exec(reason)
-  if (duration) return `已达到持续时间上限（${duration[1]} 秒）`
-  return reason
+const INTEGRITY_PRESENTATIONS: Record<TeamworkLocale, Record<IntegrityMode, string>> = {
+  en: {
+    development: "development",
+    demo: "demo",
+    benchmark: "benchmark",
+  },
+  "zh-TW": {
+    development: "開發模式",
+    demo: "展示模式",
+    benchmark: "評測模式",
+  },
+  "zh-CN": {
+    development: "开发模式",
+    demo: "展示模式",
+    benchmark: "评测模式",
+  },
 }
 
-/**
- * Formats status text generated by this plugin. Unknown text can come from a
- * user-authored blocker, checkpoint, or older plugin and stays byte-for-byte
- * intact at the presentation boundary.
- */
-export function presentGoalLastStatus(status: string, locale: GoalLocale): string {
-  if (locale !== "zh-CN") return status
-
-  const direct: Record<string, string> = {
-    "Goal set.": "目标已设置。",
-    "Goal recorded from Plan mode; execution paused until resumed from Build mode.":
-      "目标已在 Plan 模式下记录；执行已暂停，需在 Build 模式下继续。",
-    "Goal objective updated; execution paused while the session is in Plan mode.":
-      "目标内容已更新；会话处于 Plan 模式，因此执行已暂停。",
-    "Goal objective updated and resumed.": "目标内容已更新并继续执行。",
-    "Goal objective updated and paused.": "目标内容已更新并暂停。",
-    "Auto-continue paused while the session is in Plan mode.": "会话处于 Plan 模式，因此自动继续已暂停。",
-    "Goal resumed.": "目标已继续。",
-    "Goal paused.": "目标已暂停。",
-    "Goal completed.": "目标已完成。",
-    "Goal marked unmet.": "目标已标记为未达成。",
-    "Auto-continue attempt canceled before delivery.": "自动继续尝试已在发送前取消。",
-    "Auto-continue prompt sent.": "自动继续提示已发送。",
-    "Auto-continue prompt failed repeatedly. Resume the goal to retry.": "自动继续提示反复失败。请继续目标后重试。",
-    "Goal execution is paused while the session is in Plan mode. Switch to Build mode and resume the goal to continue.":
-      "会话处于 Plan 模式，因此目标执行已暂停。请切换到 Build 模式并继续目标。",
-  }
-  if (direct[status]) return direct[status]
-
-  const lowProgressPausePattern =
-    /^Auto-continue paused after (\d+) low-progress continuation turn\(s\)\. Resume the goal to retry\.$/
-  const lowProgressPause = lowProgressPausePattern.exec(status)
-  if (lowProgressPause) return `自动继续已在 ${lowProgressPause[1]} 个低进展轮次后暂停。请继续目标后重试。`
-
-  const lowProgress = /^Low-progress continuation turn detected \((\d+)\/(\d+|unbounded)\)\.$/.exec(status)
-  if (lowProgress) {
-    const limit = lowProgress[2] === "unbounded" ? "不限" : lowProgress[2]
-    return `检测到低进展的继续轮次（${lowProgress[1]}/${limit}）。`
-  }
-
-  const reserved = /^Auto-continue (\d+) reserved\.$/.exec(status)
-  if (reserved) return `已预留第 ${reserved[1]} 次自动继续。`
-  const failed = /^Auto-continue failed (\d+) time\(s\)\.$/.exec(status)
-  if (failed) return `自动继续已失败 ${failed[1]} 次。`
-  const pausedAfterFailures = /^Paused after (\d+) auto-continue failure\(s\)\.$/.exec(status)
-  if (pausedAfterFailures) return `已在 ${pausedAfterFailures[1]} 次自动继续失败后暂停。`
-
-  const wrapUp = /^(.*); wrap-up required\.$/.exec(status)
-  if (wrapUp) return `${presentGoalStopReason(wrapUp[1]!, locale)}；需要收尾。`
-  return status
+export function presentIntegrityMode(mode: string, locale: TeamworkLocale): string {
+  return INTEGRITY_PRESENTATIONS[locale][mode as IntegrityMode] ?? mode
 }
 
-const HISTORY_TYPE_PRESENTATIONS: Record<GoalLocale, Record<string, string>> = {
+const ROLE_PRESENTATIONS: Record<TeamworkLocale, Record<string, string>> = {
+  en: {
+    sentinel: "Sentinel",
+    orchestrator: "Project Orchestrator",
+    explorer: "Explorer",
+    worker: "Worker",
+    critic: "Critic",
+    challenger: "Challenger",
+    auditor: "Auditor",
+    successAuditor: "Success Auditor",
+  },
+  "zh-TW": {
+    sentinel: "Sentinel",
+    orchestrator: "專案協調者",
+    explorer: "探索者",
+    worker: "實作工人",
+    critic: "審查者",
+    challenger: "挑戰者",
+    auditor: "稽核者",
+    successAuditor: "成功稽核者",
+  },
+  "zh-CN": {
+    sentinel: "Sentinel",
+    orchestrator: "项目协调者",
+    explorer: "探索者",
+    worker: "实现工人",
+    critic: "审查者",
+    challenger: "挑战者",
+    auditor: "稽核者",
+    successAuditor: "成功稽核者",
+  },
+}
+
+export function presentRole(role: string, locale: TeamworkLocale): string {
+  return ROLE_PRESENTATIONS[locale][role] ?? role
+}
+
+const HISTORY_TYPE_PRESENTATIONS: Record<TeamworkLocale, Record<string, string>> = {
   en: {},
+  "zh-TW": {
+    created: "已建立",
+    updated: "已更新",
+    artifact: "Artifact",
+    approved: "已批准",
+    paused: "已暫停",
+    resumed: "已恢復",
+    milestone: "里程碑",
+    verification: "驗證",
+    completed: "已完成",
+    cancelled: "已取消",
+    warning: "警告",
+    limited: "已受限",
+    error: "錯誤",
+  },
   "zh-CN": {
     created: "已创建",
     updated: "已更新",
+    artifact: "Artifact",
+    approved: "已批准",
     paused: "已暂停",
-    resumed: "已继续",
+    resumed: "已恢复",
+    milestone: "里程碑",
+    verification: "验证",
     completed: "已完成",
-    unmet: "未达成",
-    autoContinue: "自动继续",
-    checkpoint: "检查点",
+    cancelled: "已取消",
     warning: "警告",
     limited: "已受限",
     error: "错误",
   },
 }
 
-export function presentGoalHistoryType(type: string, locale: GoalLocale): string {
+export function presentHistoryType(type: string, locale: TeamworkLocale): string {
   return HISTORY_TYPE_PRESENTATIONS[locale][type] ?? type
 }
 
-/** Localizes only plugin-owned history framing and preserves embedded user text. */
-export function presentGoalHistoryDetail(detail: string, locale: GoalLocale): string {
-  if (locale !== "zh-CN") return detail
-  const lastStatus = presentGoalLastStatus(detail, locale)
-  if (lastStatus !== detail) return lastStatus
-
-  if (detail === "Goal set with default continuation limits.") return "目标已按默认继续限制设置。"
-  const objectiveUpdate = /^Goal objective updated: (.*)$/.exec(detail)
-  if (objectiveUpdate) return `目标内容已更新：${objectiveUpdate[1]}`
-
-  const configuredLimits = /^Goal set with (.*)\.$/.exec(detail)
-  if (configuredLimits) {
-    const limits = configuredLimits[1]!
-      .split(", ")
-      .map((value) => {
-        const tokenBudget = /^(\d+) token budget$/.exec(value)
-        if (tokenBudget) return `Token 预算 ${tokenBudget[1]}`
-        const autoContinues = /^(\d+) auto-continue limit$/.exec(value)
-        if (autoContinues) return `自动继续次数上限 ${autoContinues[1]}`
-        const duration = /^(\d+)s duration limit$/.exec(value)
-        if (duration) return `持续时间上限 ${duration[1]} 秒`
-        return value
-      })
-      .join("，")
-    return `目标已设置，限制为：${limits}。`
-  }
-
-  const finalHandoff = /^(\w+): (.*); requested final handoff\.$/.exec(detail)
-  if (finalHandoff) {
-    return `${presentGoalStatus(finalHandoff[1]!, locale)}：${presentGoalStopReason(finalHandoff[2]!, locale)}；已请求最终交接。`
-  }
-  return detail
-}
-
-type PresentableGoalHistory = {
+export type PresentableProjectHistory = {
   history: Array<{ type: string; detail: string; timestamp: number }>
 }
 
-export function formatGoalHistoryPresentation(goal: PresentableGoalHistory | null, locale: GoalLocale): string {
-  if (!goal) return locale === "zh-CN" ? "此会话没有可用的目标历史。" : "No goal history is available for this session."
-  if (goal.history.length === 0) return locale === "zh-CN" ? "尚未记录目标历史。" : "No goal history recorded yet."
-  return goal.history
+export function formatProjectHistory(project: PresentableProjectHistory | null, locale: TeamworkLocale): string {
+  if (!project) {
+    return locale === "en" ? "No project history is available for this session." : "此 session 沒有可用的專案歷史。"
+  }
+  if (project.history.length === 0) {
+    return locale === "en" ? "No project history recorded yet." : "尚未記錄專案歷史。"
+  }
+  return project.history
     .map((entry) => {
       const timestamp = new Date(entry.timestamp * 1000).toISOString()
-      const type = presentGoalHistoryType(entry.type, locale)
-      const detail = presentGoalHistoryDetail(entry.detail, locale)
-      return `- [${timestamp}] ${type}: ${detail}`
+      const type = presentHistoryType(entry.type, locale)
+      return `- [${timestamp}] ${type}: ${entry.detail}`
     })
     .join("\n")
 }

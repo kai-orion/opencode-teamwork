@@ -1,32 +1,33 @@
 {
-  "name": "@prevalentware/opencode-goal-plugin",
-  "version": "0.1.1",
-  "description": "OpenCode goal plugin that adds Codex-style long-running goal mode, /goal commands, persistence, and TUI status for AI coding agents.",
+  "name": "@sandlada/opencode-teamwork",
+  "version": "0.0.1-20260926.a",
+  "description": "OpenCode plugin that brings Antigravity-style multi-agent teamwork (/teamwork) to OpenCode: scoping interview, milestone state machine, adversarial verification gates, and a TUI status sidebar.",
   "keywords": [
     "opencode",
     "opencode-plugin",
-    "opencode goal plugin",
-    "opencode goal mode",
-    "opencode ai",
-    "goal",
-    "goal-mode",
+    "opencode-teamwork",
+    "teamwork",
+    "multi-agent",
+    "agent-team",
+    "milestones",
+    "verification",
+    "antigravity",
     "slash-command",
     "coding-agent",
     "ai-agent",
     "developer-tools",
-    "agent",
     "tui"
   ],
-  "homepage": "https://github.com/prevalentWare/opencode-goal-plugin#readme",
+  "homepage": "https://github.com/kai-orion/opencode-teamwork#readme",
   "bugs": {
-    "url": "https://github.com/prevalentWare/opencode-goal-plugin/issues"
+    "url": "https://github.com/kai-orion/opencode-teamwork/issues"
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/prevalentWare/opencode-goal-plugin.git"
+    "url": "git+https://github.com/kai-orion/opencode-teamwork.git"
   },
   "license": "MIT",
-  "author": "Prevalentware",
+  "author": "Kai Orion & Sandlada",
   "type": "module",
   "exports": {
     "./server": {
@@ -47,7 +48,6 @@
     "clean": "rm -rf dist",
     "build": "bun run clean && bun build ./src/server.ts --outdir ./dist --target bun --external @opencode-ai/plugin --external effect --external zod",
     "ci:version": "bun scripts/resolve-ci-version.ts",
-    "lint": "eslint .",
     "pack:dry-run": "npm pack --dry-run",
     "test": "bun test",
     "smoke:v2": "bun scripts/smoke-v2-lifecycle.ts",
@@ -65,7 +65,6 @@
     "solid-js": ">=1.9.0"
   },
   "devDependencies": {
-    "@eslint/js": "^10.0.1",
     "@opencode/client": "0.0.0-beta-19425",
     "@opencode/plugin": "0.0.0-beta-19425",
     "@opencode/schema": "0.0.0-beta-19425",
@@ -74,11 +73,9 @@
     "@opentui/solid": "0.5.9",
     "@types/bun": "^1.3.13",
     "@types/semver": "^7.8.0",
-    "eslint": "^10.3.0",
     "semver": "^7.8.5",
     "solid-js": "1.9.12",
-    "typescript": "^6.0.3",
-    "typescript-eslint": "^8.59.2"
+    "typescript": "^6.0.3"
   },
   "engines": {
     "opencode": ">=0.0.0-beta-0 <0.0.0 || >=1.17.1"
