@@ -1,5 +1,6 @@
 import { expect, test } from "bun:test"
 import { readFileSync } from "node:fs"
+import { dirname, join } from "node:path"
 import { satisfies } from "semver"
 
 test("published tui entrypoint shares host runtime instances via peerDependencies", () => {
@@ -36,5 +37,35 @@ test("engines.opencode covers the V2 beta line and stable 2.x while excluding th
   }
   for (const version of ["0.0.0", "0.0.1", "0.5.0", "1.0.0", "1.17.0", "1.17.1", "1.17.2", "1.18.0"]) {
     expect(satisfies(version, range)).toBe(false)
+  }
+})
+
+test("published files include every module in the tui import closure", () => {
+  const packageJson = JSON.parse(readFileSync("package.json", "utf8")) as {
+    files?: string[]
+    exports?: Record<string, { import?: string }>
+  }
+  const tuiEntry = packageJson.exports?.["./tui"]?.import
+  expect(tuiEntry).toBeString()
+  if (typeof tuiEntry !== "string") throw new Error("expected exports['./tui'].import to be a string")
+
+  // The TUI ships as source, so every relative import reachable from the
+  // entrypoint must also ship — otherwise the host fails with
+  // "Cannot find module './...'". Walk the closure and assert coverage.
+  const shipped = new Set(packageJson.files ?? [])
+  const visited = new Set<string>()
+  const queue = [tuiEntry.replace(/^\.\//, "")]
+  const relativeImport = /from\s+["'](\.[^"']*)["']/g
+  while (queue.length > 0) {
+    const current = queue.pop()!
+    if (visited.has(current)) continue
+    visited.add(current)
+    expect(shipped.has(current)).toBe(true)
+    const source = readFileSync(current, "utf8")
+    for (const match of source.matchAll(relativeImport)) {
+      const specifier = match[1]!
+      const resolved = join(dirname(current), specifier).replace(/\\/g, "/")
+      queue.push(resolved.endsWith(".ts") ? resolved : `${resolved}.ts`)
+    }
   }
 })

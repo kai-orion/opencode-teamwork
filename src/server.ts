@@ -3,7 +3,7 @@ import type * as PluginV2 from "@opencode/plugin"
 import type { Info as ToolV2Info } from "@opencode/plugin/promise/tool"
 import type { Tool as ToolSchema } from "@opencode/schema/tool"
 import { appendFileSync } from "node:fs"
-import { TeamEngine } from "./engine"
+import { TeamEngine, TEAMWORK_TITLE_PREFIX } from "./engine"
 import type { PlanMilestoneInput, ReportPayload, SessionOps } from "./engine"
 import { writeArtifacts } from "./artifacts"
 import {
@@ -23,6 +23,7 @@ import {
   approveProject,
   cancelProject,
   createProject,
+  getAllProjects,
   getProject,
   onStateRecovery,
   pauseProject,
@@ -359,6 +360,29 @@ async function setupV2(context: PluginV2.Plugin.Context): Promise<PluginV2.Plugi
   }
   agentSupport.namedAgents = namedAgentsAvailable
 
+  // Runtime capability probe: the V2 host may pass a narrower session domain
+  // than the type declares. Log what is actually available so the cleanup
+  // strategy degrades correctly.
+  try {
+    const runtimeSession = context.session as unknown as Record<string, unknown>
+    const available = Object.getOwnPropertyNames(Object.getPrototypeOf(runtimeSession) ?? {})
+      .concat(Object.keys(runtimeSession))
+      .filter((key, index, all) => all.indexOf(key) === index)
+    trace(`setup: session methods = [${available.join(", ")}]`)
+  } catch (error) {
+    trace(`setup: session probe failed: ${error instanceof Error ? error.message : String(error)}`)
+  }
+
+  // --- Residual sweep -------------------------------------------------------
+  //
+  // Projects that closed (complete/cancel) may still have role sessions on
+  // disk when the process died before cleanup ran. On setup, delete them so
+  // crashed runs do not leave debris in the user's session list. Sessions
+  // are only removed when they carry the teamwork metadata marker.
+  void sweepResidualSessionsV2(context, directory).catch((error) => {
+    trace(`residual sweep failed: ${error instanceof Error ? error.message : String(error)}`)
+  })
+
   // --- Commands ------------------------------------------------------------
 
   if (registerCommand) {
@@ -516,6 +540,52 @@ async function setupV2(context: PluginV2.Plugin.Context): Promise<PluginV2.Plugi
   }
 }
 
+/**
+ * Deletes leftover role sessions from closed (complete/cancelled) projects.
+ * A session is only removed when it still exists and carries the teamwork
+ * metadata marker, so user-created sessions are never touched. Best-effort
+ * and idempotent: missing sessions resolve to "already gone".
+ */
+async function sweepResidualSessionsV2(context: PluginV2.Plugin.Context, directory: string) {
+  const allProjects = await getAllProjects()
+  const closed = allProjects.filter(
+    (project) => isClosedPhase(project.phase) && (project.workingDirectory ?? directory) === directory,
+  )
+  if (closed.length === 0) return
+  const candidates = new Set<string>()
+  for (const project of closed) {
+    for (const milestone of project.milestones) {
+      for (const track of milestone.tracks) {
+        if (track.sessionID) candidates.add(track.sessionID)
+      }
+    }
+  }
+  if (candidates.size === 0) return
+  const domain = context.session as unknown as Record<string, unknown>
+  const remove = domain.remove as ((input: { sessionID: string }) => Promise<unknown>) | undefined
+  const update = domain.update as ((input: { sessionID: string; title: string }) => Promise<unknown>) | undefined
+  for (const sessionID of candidates) {
+    try {
+      const info = unwrap<{ metadata?: Record<string, unknown>; title?: string }>(await context.session.get({ sessionID }))
+      if (!info || info.metadata?.teamwork !== true) continue
+      if (typeof remove === "function") {
+        await remove({ sessionID })
+        trace(`residual sweep: removed ${sessionID}`)
+      } else if (typeof update === "function" && !String(info.title ?? "").includes("[teamwork done]")) {
+        // Host cannot delete: at least make the leftover recognizable.
+        await update({ sessionID, title: `${info.title ?? "teamwork session"} [teamwork done]` })
+        trace(`residual sweep: marked ${sessionID}`)
+      }
+    } catch {
+      // Missing or undeletable session: skip.
+    }
+  }
+}
+
+function isClosedPhase(phase: string): boolean {
+  return phase === "complete" || phase === "cancelled"
+}
+
 function sessionOps(context: PluginV2.Plugin.Context, agentSupport: { namedAgents: boolean }): SessionOps {
   const directory = context.location?.directory ?? process.cwd()
   const traceSession = (message: string) => {
@@ -533,15 +603,64 @@ function sessionOps(context: PluginV2.Plugin.Context, agentSupport: { namedAgent
     async createSession({ agent, title }) {
       const useAgent = agentSupport.namedAgents
       traceSession(`create start (${agent}, named=${useAgent})`)
+      // Mark the session so tools, the TUI, and the residual sweep can tell
+      // teamwork sessions apart from user-created ones.
+      const [projectSlug] = title.startsWith(TEAMWORK_TITLE_PREFIX)
+        ? [title.slice(TEAMWORK_TITLE_PREFIX.length).trim().split(" — ")[0] ?? "unknown"]
+        : ["unknown"]
       const response = await context.session.create({
         ...(useAgent ? { agent } : {}),
         title,
         location: { directory },
+        metadata: {
+          teamwork: true,
+          agent,
+          projectSlug,
+        },
       })
       const info = unwrap<{ id?: string }>(response)
       if (!info?.id) throw new Error("session.create returned no session id")
       traceSession(`created ${info.id}`)
       return { sessionID: info.id, agentApplied: useAgent }
+    },
+    async removeSession(sessionID) {
+      // The V2 SessionDomain type omits `remove`, but the host hands the plugin
+      // the full session API at runtime (HTTP DELETE /api/session/{id}).
+      const candidate = context.session as typeof context.session & {
+        remove?: (input: { sessionID: string }) => Promise<unknown>
+      }
+      if (typeof candidate.remove !== "function") {
+        traceSession(`remove unavailable host ${sessionID}`)
+        return false
+      }
+      try {
+        await candidate.remove({ sessionID })
+        traceSession(`removed ${sessionID}`)
+        return true
+      } catch (error) {
+        traceSession(`remove FAILED ${sessionID}: ${error instanceof Error ? error.message : String(error)}`)
+        return false
+      }
+    },
+    async renameSession(sessionID, title) {
+      // The runtime domain exposes `update` (title/metadata PATCH) but not
+      // `rename`; accept either so the fallback works across host versions.
+      const domain = context.session as unknown as Record<string, unknown>
+      try {
+        const update = domain.update
+        if (typeof update === "function") {
+          await (update as (input: { sessionID: string; title: string }) => Promise<unknown>)({ sessionID, title })
+          return
+        }
+        const rename = domain.rename
+        if (typeof rename === "function") {
+          await (rename as (input: { sessionID: string; title: string }) => Promise<unknown>)({ sessionID, title })
+          return
+        }
+        traceSession(`rename unavailable host ${sessionID}`)
+      } catch (error) {
+        traceSession(`rename FAILED ${sessionID}: ${error instanceof Error ? error.message : String(error)}`)
+      }
     },
     async promptSession(sessionID, text) {
       traceSession(`prompt ${sessionID} (${text.length} chars)`)

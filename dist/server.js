@@ -604,6 +604,10 @@ async function getProject(sessionID) {
   const project = state.projects[sessionID];
   return project ? snapshot(project) : null;
 }
+async function getAllProjects() {
+  const state = await readState();
+  return Object.values(state.projects).sort((left, right) => right.updatedAt - left.updatedAt).map(snapshot);
+}
 async function createProject(sessionID, brief, options, agent) {
   const normalizedBrief = {
     name: normalizeSlug(boundedText(brief.name, "project name", 200)),
@@ -1621,6 +1625,9 @@ async function refreshPlanAndProgress(directory, project) {
 }
 
 // src/engine.ts
+var TEAMWORK_TITLE_PREFIX = "[teamwork]";
+var TEAMWORK_DONE_PREFIX = "[teamwork done]";
+
 class AbortedError extends Error {
   constructor() {
     super("teamwork engine aborted");
@@ -1711,7 +1718,13 @@ class TeamEngine {
     await this.abortRoleSessions(runtime);
   }
   async cancel(sessionID) {
-    await this.pause(sessionID);
+    const runtime = this.runtimes.get(sessionID);
+    if (runtime) {
+      await this.pause(sessionID);
+      await this.cleanupRoleSessions(runtime);
+      return;
+    }
+    await this.cleanupRoleSessionsStatic(sessionID);
   }
   async finalizeAbort(runtime) {
     try {
@@ -1719,6 +1732,26 @@ class TeamEngine {
       if (!project || project.phase !== "budgetLimited")
         return;
       await this.ops.sendSynthetic(runtime.sessionID, `[Teamwork Sentinel] Project "${project.slug}" hit its budget limit (${project.stopReason ?? "limit reached"}). Ask the team to wrap up or adjust the budgets, then resume with /teamwork-resume.`);
+    } catch {}
+  }
+  async cleanupRoleSessionsStatic(sessionID) {
+    try {
+      const project = await getProject(sessionID);
+      if (!project)
+        return;
+      for (const milestone of project.milestones) {
+        for (const track of milestone.tracks) {
+          if (!track.sessionID)
+            continue;
+          const removed = await this.ops.removeSession(track.sessionID).catch(() => false);
+          if (!removed) {
+            await this.ops.renameSession(track.sessionID, `${TEAMWORK_DONE_PREFIX} ${project.slug}`).catch(() => {
+              return;
+            });
+          }
+          this.roleOwners.delete(track.sessionID);
+        }
+      }
     } catch {}
   }
   async abortRoleSessions(runtime) {
@@ -2004,6 +2037,7 @@ class TeamEngine {
       }
       const evidence = [...report.evidence.slice(0, 10), ...report.findings.slice(0, 10)].join("; ");
       await completeProject(runtime.sessionID, evidence || "The Success Auditor passed the end-to-end verification.");
+      await this.cleanupRoleSessions(runtime);
       await setSentinelUpdate(runtime.sessionID, `Project "${project.slug}" completed and verified end to end.`);
       await refreshPlanAndProgress(runtime.directory, await getProject(runtime.sessionID));
       await this.ops.sendSynthetic(runtime.sessionID, `[Teamwork Sentinel] Project "${project.slug}" is complete: all milestones passed and the Success Auditor verified it end to end.`);
@@ -2015,11 +2049,53 @@ class TeamEngine {
   async spawnRoleSession(runtime, role, project) {
     const result = await this.ops.createSession({
       agent: agentNameForRole(role),
-      title: `${project.slug} \u2014 ${role}`
+      title: `${TEAMWORK_TITLE_PREFIX} ${project.slug} \u2014 ${role}`
     });
     runtime.activeRoleSessions.add(result.sessionID);
     this.roleOwners.set(result.sessionID, runtime.sessionID);
     return result;
+  }
+  async roleSessionIDsFor(runtime) {
+    const sessionIDs = new Set;
+    for (const [roleSessionID, owner] of this.roleOwners) {
+      if (owner === runtime.sessionID)
+        sessionIDs.add(roleSessionID);
+    }
+    for (const sessionID of runtime.activeRoleSessions)
+      sessionIDs.add(sessionID);
+    try {
+      const project = await getProject(runtime.sessionID);
+      if (project) {
+        for (const milestone of project.milestones) {
+          for (const track of milestone.tracks) {
+            if (track.sessionID)
+              sessionIDs.add(track.sessionID);
+          }
+        }
+      }
+    } catch {}
+    return [...sessionIDs];
+  }
+  async cleanupRoleSessions(runtime) {
+    const sessionIDs = await this.roleSessionIDsFor(runtime);
+    if (sessionIDs.length === 0)
+      return;
+    let slug = "project";
+    try {
+      const project = await getProject(runtime.sessionID);
+      if (project)
+        slug = project.slug;
+    } catch {}
+    for (const roleSessionID of sessionIDs) {
+      const removed = await this.ops.removeSession(roleSessionID).catch(() => false);
+      if (!removed) {
+        await this.ops.renameSession(roleSessionID, `${TEAMWORK_DONE_PREFIX} ${slug}`).catch(() => {
+          return;
+        });
+      }
+      this.roleOwners.delete(roleSessionID);
+      runtime.activeRoleSessions.delete(roleSessionID);
+    }
   }
   async awaitReport(runtime, roleSessionID) {
     const waiter = createDeferred();
@@ -2552,6 +2628,16 @@ async function setupV2(context) {
     trace(`agent list failed: ${error instanceof Error ? error.message : String(error)}`);
   }
   agentSupport.namedAgents = namedAgentsAvailable;
+  try {
+    const runtimeSession = context.session;
+    const available = Object.getOwnPropertyNames(Object.getPrototypeOf(runtimeSession) ?? {}).concat(Object.keys(runtimeSession)).filter((key, index, all) => all.indexOf(key) === index);
+    trace(`setup: session methods = [${available.join(", ")}]`);
+  } catch (error) {
+    trace(`setup: session probe failed: ${error instanceof Error ? error.message : String(error)}`);
+  }
+  sweepResidualSessionsV2(context, directory).catch((error) => {
+    trace(`residual sweep failed: ${error instanceof Error ? error.message : String(error)}`);
+  });
   if (registerCommand) {
     let listed = [];
     try {
@@ -2691,6 +2777,43 @@ async function setupV2(context) {
     console.error("[opencode-teamwork] setup: cleanup complete");
   };
 }
+async function sweepResidualSessionsV2(context, directory) {
+  const allProjects = await getAllProjects();
+  const closed = allProjects.filter((project) => isClosedPhase(project.phase) && (project.workingDirectory ?? directory) === directory);
+  if (closed.length === 0)
+    return;
+  const candidates = new Set;
+  for (const project of closed) {
+    for (const milestone of project.milestones) {
+      for (const track of milestone.tracks) {
+        if (track.sessionID)
+          candidates.add(track.sessionID);
+      }
+    }
+  }
+  if (candidates.size === 0)
+    return;
+  const domain = context.session;
+  const remove = domain.remove;
+  const update = domain.update;
+  for (const sessionID of candidates) {
+    try {
+      const info = unwrap(await context.session.get({ sessionID }));
+      if (!info || info.metadata?.teamwork !== true)
+        continue;
+      if (typeof remove === "function") {
+        await remove({ sessionID });
+        trace(`residual sweep: removed ${sessionID}`);
+      } else if (typeof update === "function" && !String(info.title ?? "").includes("[teamwork done]")) {
+        await update({ sessionID, title: `${info.title ?? "teamwork session"} [teamwork done]` });
+        trace(`residual sweep: marked ${sessionID}`);
+      }
+    } catch {}
+  }
+}
+function isClosedPhase(phase) {
+  return phase === "complete" || phase === "cancelled";
+}
 function sessionOps(context, agentSupport) {
   const directory = context.location?.directory ?? process.cwd();
   const traceSession = (message) => {
@@ -2705,16 +2828,55 @@ function sessionOps(context, agentSupport) {
     async createSession({ agent, title }) {
       const useAgent = agentSupport.namedAgents;
       traceSession(`create start (${agent}, named=${useAgent})`);
+      const [projectSlug] = title.startsWith(TEAMWORK_TITLE_PREFIX) ? [title.slice(TEAMWORK_TITLE_PREFIX.length).trim().split(" \u2014 ")[0] ?? "unknown"] : ["unknown"];
       const response = await context.session.create({
         ...useAgent ? { agent } : {},
         title,
-        location: { directory }
+        location: { directory },
+        metadata: {
+          teamwork: true,
+          agent,
+          projectSlug
+        }
       });
       const info = unwrap(response);
       if (!info?.id)
         throw new Error("session.create returned no session id");
       traceSession(`created ${info.id}`);
       return { sessionID: info.id, agentApplied: useAgent };
+    },
+    async removeSession(sessionID) {
+      const candidate = context.session;
+      if (typeof candidate.remove !== "function") {
+        traceSession(`remove unavailable host ${sessionID}`);
+        return false;
+      }
+      try {
+        await candidate.remove({ sessionID });
+        traceSession(`removed ${sessionID}`);
+        return true;
+      } catch (error) {
+        traceSession(`remove FAILED ${sessionID}: ${error instanceof Error ? error.message : String(error)}`);
+        return false;
+      }
+    },
+    async renameSession(sessionID, title) {
+      const domain = context.session;
+      try {
+        const update = domain.update;
+        if (typeof update === "function") {
+          await update({ sessionID, title });
+          return;
+        }
+        const rename = domain.rename;
+        if (typeof rename === "function") {
+          await rename({ sessionID, title });
+          return;
+        }
+        traceSession(`rename unavailable host ${sessionID}`);
+      } catch (error) {
+        traceSession(`rename FAILED ${sessionID}: ${error instanceof Error ? error.message : String(error)}`);
+      }
     },
     async promptSession(sessionID, text) {
       traceSession(`prompt ${sessionID} (${text.length} chars)`);

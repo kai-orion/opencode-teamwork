@@ -56,6 +56,15 @@ export type SessionOps = {
    * embeds the role's system prompt into the task text instead.
    */
   createSession(input: { agent: string; title: string }): Promise<{ sessionID: string; agentApplied: boolean }>
+  /**
+   * Best-effort deletion of a role session once it is no longer needed, so
+   * teamwork sessions do not pile up in the user's session list. Returns
+   * whether the session was actually removed; when the host does not expose
+   * removal, the caller falls back to marking the title as finished.
+   */
+  removeSession(sessionID: string): Promise<boolean>
+  /** Best-effort title rename (fallback when removal is unavailable). */
+  renameSession(sessionID: string, title: string): Promise<void>
   /** Delivers a user prompt to a session. */
   promptSession(sessionID: string, text: string): Promise<void>
   /** Resolves when the session finishes its current turn (or errors). */
@@ -72,6 +81,11 @@ export type EngineOptions = {
   directory: string
   locale: TeamworkLocale
 }
+
+/** Prefix for role session titles so users can spot teamwork sessions at a glance. */
+export const TEAMWORK_TITLE_PREFIX = "[teamwork]"
+/** Title prefix for finished role sessions the host could not delete. */
+export const TEAMWORK_DONE_PREFIX = "[teamwork done]"
 
 class AbortedError extends Error {
   constructor() {
@@ -192,7 +206,17 @@ export class TeamEngine {
   }
 
   async cancel(sessionID: string) {
-    await this.pause(sessionID)
+    const runtime = this.runtimes.get(sessionID)
+    // Cancel is terminal (unlike pause): remove the role sessions so the user
+    // is not left with a pile of dead teamwork sessions.
+    if (runtime) {
+      await this.pause(sessionID)
+      await this.cleanupRoleSessions(runtime)
+      return
+    }
+    // No live runtime (e.g. cancel after a server restart): still clean up
+    // recorded sessions from state, followed by aborts being unnecessary.
+    await this.cleanupRoleSessionsStatic(sessionID)
   }
 
   /** After an abort, tell the user why the team stopped if not already told. */
@@ -206,6 +230,31 @@ export class TeamEngine {
       )
     } catch {
       // Notification is best-effort.
+    }
+  }
+
+  /**
+   * Cleanup path for projects without a live runtime: the sessions are read
+   * from persisted state (milestone tracks), not from the runtime cache.
+   */
+  private async cleanupRoleSessionsStatic(sessionID: string) {
+    try {
+      const project = await getProject(sessionID)
+      if (!project) return
+      for (const milestone of project.milestones) {
+        for (const track of milestone.tracks) {
+          if (!track.sessionID) continue
+          const removed = await this.ops.removeSession(track.sessionID).catch(() => false)
+          if (!removed) {
+            await this.ops
+              .renameSession(track.sessionID, `${TEAMWORK_DONE_PREFIX} ${project.slug}`)
+              .catch(() => undefined)
+          }
+          this.roleOwners.delete(track.sessionID)
+        }
+      }
+    } catch {
+      // Cleanup is best-effort; cancel must succeed regardless.
     }
   }
 
@@ -589,6 +638,9 @@ export class TeamEngine {
       }
       const evidence = [...report.evidence.slice(0, 10), ...report.findings.slice(0, 10)].join("; ")
       await completeProject(runtime.sessionID, evidence || "The Success Auditor passed the end-to-end verification.")
+      // The project is done: remove the role sessions so the user's session
+      // list does not accumulate teamwork leftovers.
+      await this.cleanupRoleSessions(runtime)
       await setSentinelUpdate(runtime.sessionID, `Project "${project.slug}" completed and verified end to end.`)
       await refreshPlanAndProgress(runtime.directory, (await getProject(runtime.sessionID))!)
       await this.ops.sendSynthetic(
@@ -610,11 +662,65 @@ export class TeamEngine {
   ): Promise<{ sessionID: string; agentApplied: boolean }> {
     const result = await this.ops.createSession({
       agent: agentNameForRole(role as RoleAgentName),
-      title: `${project.slug} — ${role}`,
+      title: `${TEAMWORK_TITLE_PREFIX} ${project.slug} — ${role}`,
     })
     runtime.activeRoleSessions.add(result.sessionID)
     this.roleOwners.set(result.sessionID, runtime.sessionID)
     return result
+  }
+
+  /**
+   * Collects every role session belonging to this project: milestone tracks
+   * (via state) plus the engine's runtime cache. Returns unique IDs.
+   */
+  private async roleSessionIDsFor(runtime: ProjectRuntime): Promise<string[]> {
+    const sessionIDs = new Set<string>()
+    for (const [roleSessionID, owner] of this.roleOwners) {
+      if (owner === runtime.sessionID) sessionIDs.add(roleSessionID)
+    }
+    for (const sessionID of runtime.activeRoleSessions) sessionIDs.add(sessionID)
+    try {
+      const project = await getProject(runtime.sessionID)
+      if (project) {
+        for (const milestone of project.milestones) {
+          for (const track of milestone.tracks) {
+            if (track.sessionID) sessionIDs.add(track.sessionID)
+          }
+        }
+      }
+    } catch {
+      // Cleanup is best-effort; state problems must not block unwinding.
+    }
+    return [...sessionIDs]
+  }
+
+  /**
+   * Removes every role session of the project, best-effort. Called when the
+   * project completes or is cancelled; paused projects keep their sessions so
+   * users can resume with full context.
+   */
+  private async cleanupRoleSessions(runtime: ProjectRuntime) {
+    const sessionIDs = await this.roleSessionIDsFor(runtime)
+    if (sessionIDs.length === 0) return
+    let slug = "project"
+    try {
+      const project = await getProject(runtime.sessionID)
+      if (project) slug = project.slug
+    } catch {
+      // Cleanup is best-effort; state problems must not block unwinding.
+    }
+    for (const roleSessionID of sessionIDs) {
+      const removed = await this.ops.removeSession(roleSessionID).catch(() => false)
+      if (!removed) {
+        // Host does not expose removal: mark the title so lingering sessions
+        // stay recognizable as finished teamwork sessions.
+        await this.ops
+          .renameSession(roleSessionID, `${TEAMWORK_DONE_PREFIX} ${slug}`)
+          .catch(() => undefined)
+      }
+      this.roleOwners.delete(roleSessionID)
+      runtime.activeRoleSessions.delete(roleSessionID)
+    }
   }
 
   private async awaitReport(runtime: ProjectRuntime, roleSessionID: string) {

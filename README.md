@@ -39,6 +39,14 @@ Auditor               checks the work against the integrity mode and real comman
 - **Reports or failure.** Every role session must submit a structured `teamwork_report`; a session that ends without one has failed its task. Fabricated evidence is a failure by definition.
 - **Everything is reviewable.** `request.md`, `plan.md`, and `progress.md` live in `.opencode/teamwork/<slug>/` as real markdown, and the TUI sidebar shows live phase, milestone progress, active tracks, and budget usage.
 
+### Where role sessions show up
+
+Teamwork role sessions appear in your OpenCode session list while a project runs, with a `[teamwork]` title prefix (for example `[teamwork] fastify-migration — worker`) and a `teamwork: true` metadata marker so they are easy to recognize — and easy to tell apart from your own sessions. Hygiene is automatic:
+
+- **Completed or cancelled projects** clean up all of their role sessions. Where the host exposes session removal (HTTP `DELETE /api/session/{id}`) they are deleted outright; otherwise their titles are rewritten to `[teamwork done] <slug>` so leftovers stay recognizable.
+- **Crashed runs** are swept on the next plugin load (only sessions carrying the `teamwork` metadata marker are touched).
+- **Paused projects** keep their sessions on purpose, so `/teamwork-resume` continues with full context.
+
 ### Integrity modes
 
 | Mode | Purpose | Verification behavior |

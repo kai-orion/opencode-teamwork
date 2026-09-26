@@ -341,18 +341,47 @@ try {
     }
   }, () => `phase=${phase ?? "unknown"}, stopReason=${lastStop ?? "none"}`)
   const finalState = JSON.parse(await readFile(stateFile, "utf8")) as {
-    projects?: Record<string, { completionEvidence?: string; milestones: Array<{ status: string }> }>
+    projects?: Record<string, { completionEvidence?: string; milestones: Array<{ status: string; tracks: Array<{ sessionID?: string | null }> }> }>
   }
   const finished = finalState.projects![sessionID]!
   assert(finished.completionEvidence && finished.completionEvidence.length > 0, "completion evidence missing")
   assert(finished.milestones.every((milestone) => milestone.status === "passed"), "not every milestone passed")
   assert(modelCalls >= 8, `too few model calls for the full lifecycle: ${modelCalls}`)
 
+  // Session hygiene: after completion every role session must be either gone
+  // from the list or, when the host does not expose session removal, renamed
+  // with the [teamwork done] marker. The [teamwork] creation prefix is covered
+  // by the engine unit tests.
+  const roleSessionIDs = finished.milestones
+    .flatMap((milestone) => milestone.tracks)
+    .filter((track) => typeof track.sessionID === "string" && track.sessionID)
+    .map((track) => track.sessionID!)
+  assert(roleSessionIDs.length > 0, "no role session IDs recorded in state")
+  // Cleanup runs shortly after the phase flips to complete: poll until every
+  // role session is gone or marked.
+  const hygieneDeadline = Date.now() + 30_000
+  let leftovers: Array<{ id: string; title?: string }> = []
+  for (;;) {
+    const current = await api(`/api/session?limit=200&directory=${encodeURIComponent(project)}`) as {
+      data: Array<{ id: string; title?: string }>
+    }
+    leftovers = current.data.filter((session) => roleSessionIDs.includes(session.id))
+    if (leftovers.every((session) => String(session.title ?? "").includes("[teamwork done]"))) break
+    if (Date.now() > hygieneDeadline) break
+    await Bun.sleep(100)
+  }
+  const unmarked = leftovers.filter((session) => !String(session.title ?? "").includes("[teamwork done]"))
+  assert(
+    unmarked.length === 0,
+    `role sessions were neither removed nor marked finished: ${unmarked.map((session) => `${session.id}:${session.title ?? "?"}`).join(",")}`,
+  )
+
   const summary = {
     result: "PASS",
     packagePath,
     sessionID,
     modelCalls,
+    roleSessionIDs: roleSessionIDs.length,
     phase,
     milestones: finished.milestones.length,
     artifacts: root,
