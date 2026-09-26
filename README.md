@@ -62,10 +62,10 @@ Projects are budget-aware: optional token / wall-clock / team-session budgets ac
 
 ## Installation
 
-Requires OpenCode ≥ 1.17.1 (V2 runtime).
+Requires OpenCode 2.x (V2 runtime only; 1.x is not supported).
 
 ```bash
-opencode plugin @sandlada/opencode-teamwork
+opencode plugin add @sandlada/opencode-teamwork
 ```
 
 Project state is stored separately from the goal plugin at `OPENCODE_TEAMWORK_STATE_PATH` (default: your OpenCode data directory, `opencode-teamwork/projects.json`), so the two plugins can be installed together.
@@ -76,16 +76,20 @@ All options are optional plugin options:
 
 ```json
 {
-  "plugin": {
-    "@sandlada/opencode-teamwork": {
-      "locale": "auto",
-      "max_parallel_workers": 3,
-      "max_verification_retries": 2,
-      "default_token_budget": null,
-      "max_auto_turns": null,
-      "max_duration_seconds": null
+  "plugins": [
+    {
+      "package": "@sandlada/opencode-teamwork",
+      "options": {
+        "locale": "auto",
+        "max_parallel_workers": 3,
+        "max_verification_retries": 2,
+        "default_token_budget": null,
+        "max_auto_turns": null,
+        "max_duration_seconds": null,
+        "restricted_agents": ["plan"]
+      }
     }
-  }
+  ]
 }
 ```
 
