@@ -2,13 +2,16 @@ import { expect, test } from "bun:test"
 import {
   approveCommandTemplate,
   cancelCommandTemplate,
+  nativeBatchPrompt,
   pauseCommandTemplate,
+  permissionApprovalPrompt,
   resumeCommandTemplate,
   reviseCommandTemplate,
   roleAgentName,
   roleTaskPrompt,
   statusCommandTemplate,
   teamworkCommandTemplate,
+  trackSummaryPrompt,
   ROLE_AGENT_NAMES,
   ROLE_AGENT_SYSTEM_PROMPTS,
 } from "../src/prompts"
@@ -68,6 +71,7 @@ test("command templates localize and substitute $ARGUMENTS only in the interview
     const interview = teamworkCommandTemplate(locale)
     expect(interview).toContain("$ARGUMENTS")
     expect(interview).toContain("teamwork_create_project")
+    expect(interview).toContain("native")
     expect(approveCommandTemplate(locale)).toContain("teamwork_approve")
     expect(reviseCommandTemplate(locale)).toContain("teamwork_revise")
     expect(statusCommandTemplate(locale)).toContain("teamwork_get_project")
@@ -79,4 +83,42 @@ test("command templates localize and substitute $ARGUMENTS only in the interview
   }
   // Locale negotiation falls back to English templates.
   expect(teamworkCommandTemplate(resolveLocale("fr"))).toBe(teamworkCommandTemplate("en"))
+})
+
+test("native batch, track summary, and permission prompts carry the reporting contract", () => {
+  const batch = nativeBatchPrompt({
+    projectSlug: "demo",
+    workingDirectory: "/repo",
+    artifactPaths: { request: "/r.md", plan: "/p.md", progress: "/pr.md" },
+    integrityMode: "development",
+    milestoneID: "m1",
+    milestoneTitle: "Build",
+    milestoneDescription: "Build it.",
+    tracks: [{ id: "m1t1", title: "Port", role: "worker", assignedFiles: ["src/a.ts"], scratch: null }],
+  })
+  expect(batch).toContain("native execution batch")
+  expect(batch).toContain("teamwork_report")
+  expect(batch).toContain("VERBATIM")
+  const summary = trackSummaryPrompt({
+    locale: "en",
+    projectSlug: "demo",
+    trackID: "m1t1",
+    role: "worker",
+    title: "Port",
+    verdict: "pass",
+    findings: ["ok"],
+    evidence: ["npm test -> ok"],
+    running: 1,
+    queued: 2,
+  })
+  expect(summary).toContain("m1t1")
+  expect(summary).toContain("running 1, queued 2")
+  const alarm = permissionApprovalPrompt({
+    locale: "en",
+    projectSlug: "demo",
+    trackID: "m1t1",
+    role: "worker",
+    detail: "approve bash",
+  })
+  expect(alarm).toContain("[NEEDS-APPROVAL]")
 })

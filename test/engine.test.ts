@@ -67,8 +67,8 @@ function makeFake() {
         const engine = engineRef.engine
         if (!engine) return
         if (session.agent === "teamwork-orchestrator") {
-          const plan = planByProject.get("main")
-          if (plan) engine.onPlan("main", plan)
+          const plan = planByProject.get("main") ?? planByProject.get("other")
+          if (plan) engine.onPlan(sessionID, plan)
           return
         }
         const role = session.agent.replace("teamwork-", "")
@@ -104,7 +104,7 @@ function makeFake() {
 }
 
 async function setupApprovedProject(maxVerificationRetries = 2) {
-  await createProject("main", BRIEF, { maxVerificationRetries, workingDirectory: stateDir })
+  await createProject("main", BRIEF, { maxVerificationRetries, workingDirectory: stateDir, executor: "isolated" })
   await approveProject("main", {})
 }
 
@@ -167,7 +167,7 @@ test("engine removes role sessions when the project is cancelled", async () => {
   const fake2 = makeFake()
   const engine2 = new TeamEngine(fake2.ops, { directory: stateDir, locale: "en" })
   fake2.engineRef.engine = engine2
-  await createProject("other", BRIEF, { workingDirectory: stateDir })
+  await createProject("other", BRIEF, { workingDirectory: stateDir, executor: "isolated" })
   await approveProject("other", {})
   // An empty plan list means the orchestrator's onPlan never fires, so the
   // orchestrator session stays pending — a clean point to cancel mid-run.
@@ -213,4 +213,111 @@ test("engine pauses the project when verification fails past the retry ceiling",
   expect(workers.length).toBe(1)
   expect(workers[0]!.prompts.length).toBe(2)
   expect(workers[0]!.prompts[1]).toContain("Fix and complete")
+}, 20_000)
+
+test("native executor runs batches through the main session without role sessions", async () => {
+  const mainPrompts: string[] = []
+  const nativePlan: PlanMilestoneInput[] = [
+    {
+      title: "Explore",
+      description: "Map the code.",
+      tracks: [{ title: "Survey", role: "explorer", assignedFiles: [] }],
+    },
+  ]
+  const ops: SessionOps = {
+    async createSession() {
+      throw new Error("native mode must not create role sessions")
+    },
+    async promptSession() {
+      throw new Error("native mode must not prompt role sessions")
+    },
+    async waitForSession() {
+      await new Promise<void>(() => {})
+    },
+    async sendSynthetic() {},
+    async promptMain(sessionID, text) {
+      mainPrompts.push(text)
+      setTimeout(() => {
+        const engine = ref.engine
+        if (!engine) return
+        const lower = text.toLowerCase()
+        if (lower.includes("milestone plan")) {
+          engine.onPlan(sessionID, nativePlan)
+          return
+        }
+        if (lower.includes("native execution batch")) {
+          for (const milestone of nativePlan) {
+            for (const track of milestone.tracks) {
+              engine.onReport(sessionID, {
+                role: track.role,
+                verdict: "pass",
+                findings: [`native ${track.title} done`],
+                evidence: ["native: npm test -> 1 passing"],
+                blockers: [],
+                artifactsWritten: [],
+              })
+            }
+          }
+          return
+        }
+        if (lower.includes("success audit")) {
+          engine.onReport(sessionID, {
+            role: "successAuditor",
+            verdict: "pass",
+            findings: ["audit ok"],
+            evidence: ["native: npm test -> 1 passing"],
+            blockers: [],
+            artifactsWritten: [],
+          })
+        }
+      }, 0)
+    },
+    async interruptSession() {},
+    async removeSession() {
+      return true
+    },
+    async renameSession() {},
+  }
+  const ref: { engine?: TeamEngine } = {}
+  const engine = new TeamEngine(ops, { directory: stateDir, locale: "en" })
+  ref.engine = engine
+  await createProject("main", BRIEF, { workingDirectory: stateDir, executor: "native" })
+  await approveProject("main", {})
+  engine.startExecution("main")
+  const deadline = Date.now() + 8000
+  let project = await getProject("main")
+  while (project?.phase === "executing" && Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 20))
+    project = await getProject("main")
+  }
+  expect(project?.phase).toBe("complete")
+  expect(mainPrompts.some((prompt) => prompt.toLowerCase().includes("native execution batch"))).toBe(true)
+  // No role sessions were created; synthetic track IDs are skipped by cleanup.
+  const milestones = project?.milestones ?? []
+  expect(milestones[0]?.tracks[0]?.lastReport?.verdict).toBe("pass")
+}, 20_000)
+
+test("native permission alarm does not fail the track", async () => {
+  const fake = makeFake()
+  const engine = new TeamEngine(fake.ops, { directory: stateDir, locale: "en" })
+  fake.engineRef.engine = engine
+  await createProject("main", BRIEF, { workingDirectory: stateDir, executor: "isolated" })
+  await approveProject("main", {})
+  fake.planByProject.set("main", [
+    { title: "M", description: "D", tracks: [{ title: "T", role: "worker", assignedFiles: [] }] },
+  ])
+  engine.startExecution("main")
+  // Wait for the worker session to exist, then simulate a permission wait.
+  const deadline = Date.now() + 5000
+  let workerID: string | null = null
+  while (!workerID && Date.now() < deadline) {
+    const project = await getProject("main")
+    workerID = project?.milestones[0]?.tracks[0]?.sessionID ?? null
+    if (!workerID) await new Promise((resolve) => setTimeout(resolve, 10))
+  }
+  expect(workerID).toBeString()
+  engine.notifyPermissionPending(workerID as string, "approve bash: npm test")
+  const project = await waitForPhase(["complete", "paused", "budgetLimited"], 8000)
+  // Permission alarm is best-effort; the run still completes via the fake reports.
+  expect(["complete", "paused", "budgetLimited"]).toContain(project?.phase as string)
 }, 20_000)

@@ -75,8 +75,10 @@ function project(overrides: Partial<Project> = {}): Project {
     sessionsSpawned: 2,
     maxAutoTurns: null,
     maxDurationSeconds: null,
-    maxParallelWorkers: 3,
+    maxParallelWorkers: 5,
     maxVerificationRetries: 2,
+    executor: "native",
+    trackStallReminderSeconds: 1800,
     planPaused: false,
     sentinelUpdate: { message: "Milestone m1 passed", timestamp: 120 },
     history: [],
@@ -104,6 +106,7 @@ test("request artifact renders the full approved brief", () => {
   expect(markdown).toContain("# Teamwork Project Request: fastify-migration")
   expect(markdown).toContain("Migrate the REST API from Express to Fastify.")
   expect(markdown).toContain("- Integrity mode: demo")
+  expect(markdown).toContain("Executor: native")
   expect(markdown).toContain("## Acceptance criteria")
 })
 

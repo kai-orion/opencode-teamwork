@@ -200,3 +200,57 @@ test("corrupt state is quarantined before recovery", async () => {
   expect(quarantined).toBe("{corrupt")
   void valid
 })
+
+test("executor defaults to native and parallel workers clamp to 1..8", async () => {
+  const { clampParallelWorkers, isExecutorMode, normalizeExecutorMode } = await import("../src/state")
+  expect(isExecutorMode("native")).toBe(true)
+  expect(isExecutorMode("isolated")).toBe(true)
+  expect(isExecutorMode("other")).toBe(false)
+  expect(normalizeExecutorMode("isolated")).toBe("isolated")
+  expect(normalizeExecutorMode("bogus")).toBe("native")
+  expect(clampParallelWorkers(99)).toBe(8)
+  expect(clampParallelWorkers(0)).toBe(1)
+  const project = await createProject("s-exec", briefOf(), { executor: "bogus" as never })
+  expect(project.executor).toBe("native")
+  expect(project.maxParallelWorkers).toBe(5)
+  expect(project.trackStallReminderSeconds).toBe(1800)
+  const capped = await createProject("s-cap", briefOf({ name: "Cap" }), { maxParallelWorkers: 99 })
+  expect(capped.maxParallelWorkers).toBe(8)
+})
+
+test("executor can be switched while paused but not while executing", async () => {
+  const { setProjectExecutor, updateProjectBrief } = await import("../src/state")
+  await createProject("s-sw", briefOf())
+  await approveProject("s-sw", {})
+  await pauseProject("s-sw", "pause for switch")
+  const switched = await setProjectExecutor("s-sw", "isolated")
+  expect(switched.executor).toBe("isolated")
+  const revised = await updateProjectBrief(
+    "s-sw",
+    { ...briefOf(), name: "Fastify Migration" },
+    { executor: "native" },
+  )
+  expect(revised.executor).toBe("native")
+  await resumeProject("s-sw")
+  await expect(setProjectExecutor("s-sw", "isolated")).rejects.toThrow(/only be switched while awaiting/)
+})
+
+test("submitTrackReportByID and permission timer suspension work", async () => {
+  const { setMilestonePlan, submitTrackReportByID, suspendTimerForPermission } = await import("../src/state")
+  await createProject("s-rep", briefOf())
+  await approveProject("s-rep", {})
+  await setMilestonePlan("s-rep", [
+    { title: "M", description: "D", tracks: [{ title: "T", role: "worker", assignedFiles: [] }] },
+  ])
+  const submitted = await submitTrackReportByID("s-rep", 0, "m1t1", {
+    role: "worker",
+    verdict: "pass",
+    findings: ["done"],
+    evidence: ["npm test -> ok"],
+    blockers: [],
+    artifactsWritten: [],
+  })
+  expect(submitted?.milestones[0]?.tracks[0]?.lastReport?.verdict).toBe("pass")
+  const suspended = await suspendTimerForPermission("s-rep")
+  expect(suspended?.lastAccountedAt).toBeNull()
+})

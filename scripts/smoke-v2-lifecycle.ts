@@ -129,6 +129,10 @@ const model = Bun.serve({
           acceptance_criteria: "npm test passes with zero failures on the Fastify server.",
           integrity_mode: "development",
           artifact_locale: "en",
+          // Pin the smoke to the isolated executor so the lifecycle asserts
+          // session.create hygiene; native fan-out is covered by unit tests.
+          executor: "isolated",
+          max_parallel_workers: 5,
         }
       } else if (userText.includes("teamwork_approve")) {
         toolName = "teamwork_approve"

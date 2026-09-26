@@ -30,6 +30,7 @@ import {
   resumeProject,
   setProjectArtifacts,
   statePath,
+  suspendTimerForPermission,
   updateProjectBrief,
   accountProjectUsage,
   formatProjectDetail,
@@ -52,6 +53,9 @@ type Options = {
   max_auto_turns?: number
   max_duration_seconds?: number
   restricted_agents?: string[]
+  executor?: string
+  default_executor?: string
+  track_stall_reminder_seconds?: number | null
 }
 
 const DEFAULT_RESTRICTED_AGENTS = ["plan"]
@@ -68,6 +72,26 @@ function nonNegativeIntegerOrNull(value: unknown) {
 function restrictedAgentSet(options?: Options) {
   const names = Array.isArray(options?.restricted_agents) ? options.restricted_agents : DEFAULT_RESTRICTED_AGENTS
   return new Set(names.map((name) => (typeof name === "string" ? name.trim().toLowerCase() : "")).filter(Boolean))
+}
+
+function normalizeExecutorOption(value: unknown): "native" | "isolated" | null {
+  return value === "native" || value === "isolated" ? value : null
+}
+
+function defaultExecutorFromOptions(options?: Options): "native" | "isolated" {
+  return normalizeExecutorOption(options?.executor) ?? normalizeExecutorOption(options?.default_executor) ?? "native"
+}
+
+function clampParallelWorkersOption(value: unknown): number | null {
+  if (typeof value !== "number" || !Number.isSafeInteger(value)) return null
+  return Math.min(8, Math.max(1, value))
+}
+
+function stallReminderFromOptions(options?: Options): number | null | undefined {
+  if (!options || !("track_stall_reminder_seconds" in options)) return undefined
+  const value = options.track_stall_reminder_seconds
+  if (value === null) return null
+  return positiveIntegerOrNull(value) ?? undefined
 }
 
 // ---------------------------------------------------------------------------
@@ -193,6 +217,11 @@ const LOCALE_ENUM = {
   enum: ["en", "zh-TW", "zh-CN"],
 }
 
+const EXECUTOR_ENUM = {
+  type: "string",
+  enum: ["native", "isolated"],
+}
+
 const BRIEF_PROPERTIES = (messages: TeamworkMessages) => ({
   name: TEXT_SCHEMA(messages.tools.projectName),
   objectives: TEXT_SCHEMA(messages.tools.brief),
@@ -214,6 +243,9 @@ type BriefArgs = {
   token_budget?: number | null
   max_auto_turns?: number | null
   max_duration_seconds?: number | null
+  executor?: "native" | "isolated" | null
+  max_parallel_workers?: number | null
+  track_stall_reminder_seconds?: number | null
 }
 
 type ReportArgs = {
@@ -272,6 +304,50 @@ function decodeV2Event(value: unknown): V2EventLike | undefined {
   if (!isRecord(decoded) || typeof decoded.type !== "string" || !isRecord(decoded.data)) return undefined
   if (typeof decoded.created !== "number") return undefined
   return decoded as V2EventLike
+}
+
+function isPermissionPendingEvent(event: V2EventLike): boolean {
+  const type = event.type.toLowerCase()
+  if (type.includes("permission") || type.includes("approval") || type.includes("auth.ask") || type.includes("ask.permission")) {
+    return true
+  }
+  const data = event.data
+  for (const key of ["permission", "approval", "permissionRequest", "authRequest"]) {
+    if (data[key] != null) return true
+  }
+  const status = typeof data.status === "string" ? data.status.toLowerCase() : ""
+  if (status.includes("permission") || status.includes("approval") || status.includes("waiting")) {
+    // Only treat waiting-for-approval shapes as permission blocks, not every
+    // generic waiting state: require a permission-flavored marker nearby.
+    const blob = JSON.stringify(data).toLowerCase()
+    if (blob.includes("permission") || blob.includes("approval")) return true
+  }
+  return false
+}
+
+function permissionDetailFromEvent(event: V2EventLike): string {
+  const data = event.data
+  const candidates = [
+    data.detail,
+    data.message,
+    data.permission,
+    data.permissionRequest,
+    data.approval,
+    data.authRequest,
+    data.tool,
+    data.action,
+  ]
+  for (const candidate of candidates) {
+    if (typeof candidate === "string" && candidate.trim()) return candidate.trim().slice(0, 500)
+    if (isRecord(candidate)) {
+      try {
+        return JSON.stringify(candidate).slice(0, 500)
+      } catch {
+        // Fall through to the generic detail.
+      }
+    }
+  }
+  return `Host event "${event.type}" indicates a permission approval is waiting. Approve or deny it in the host UI.`
 }
 
 function logError(message: string, error: unknown) {
@@ -482,6 +558,21 @@ async function setupV2(context: PluginV2.Plugin.Context): Promise<PluginV2.Plugi
     const data = event.data
     const sessionID = typeof data.sessionID === "string" ? data.sessionID : undefined
     if (!sessionID || disposed) return
+
+    // Permission-pending detection (best-effort across host versions): any
+    // event whose type or payload mentions permission/approval is treated as
+    // a role session blocked on user approval. Slow-but-alive must not look
+    // like progress, so Sentinel alarms immediately and suspends the timer.
+    if (isPermissionPendingEvent(event)) {
+      try {
+        const detail = permissionDetailFromEvent(event)
+        await suspendTimerForPermission(engine.projectSessionFor(sessionID) ?? sessionID).catch(() => null)
+        engine.notifyPermissionPending(sessionID, detail)
+      } catch (error) {
+        logError("Failed to handle permission pending event", error)
+      }
+      return
+    }
 
     switch (event.type) {
       // Plan-mode detection: pausing the team while the user switches the
@@ -710,12 +801,25 @@ function teamworkToolsV2(services: {
           token_budget: { type: ["integer", "null"], minimum: 1, description: messages.tools.tokenBudget },
           max_auto_turns: { type: ["integer", "null"], minimum: 1, description: messages.tools.maxAutoTurns },
           max_duration_seconds: { type: ["integer", "null"], minimum: 1, description: messages.tools.maxDurationSeconds },
+          executor: { ...EXECUTOR_ENUM, description: messages.tools.executor },
+          max_parallel_workers: { type: ["integer", "null"], minimum: 1, maximum: 8, description: messages.tools.maxParallelWorkers },
+          track_stall_reminder_seconds: {
+            type: ["integer", "null"],
+            minimum: 1,
+            description: messages.tools.trackStallReminderSeconds,
+          },
         },
         ["name", "objectives", "requirements", "verification", "acceptance_criteria"],
       ),
       options: { codemode: false },
       execute: async (rawArgs, toolContext) => {
         const args = rawArgs as BriefArgs
+        const stallFromArgs =
+          "track_stall_reminder_seconds" in args
+            ? args.track_stall_reminder_seconds === null
+              ? null
+              : (positiveIntegerOrNull(args.track_stall_reminder_seconds) ?? undefined)
+            : stallReminderFromOptions(options)
         const project = await createProject(
           toolContext.sessionID,
           {
@@ -732,8 +836,12 @@ function teamworkToolsV2(services: {
             maxAutoTurns: positiveIntegerOrNull(args.max_auto_turns) ?? positiveIntegerOrNull(options.max_auto_turns),
             maxDurationSeconds:
               positiveIntegerOrNull(args.max_duration_seconds) ?? positiveIntegerOrNull(options.max_duration_seconds),
-            maxParallelWorkers: positiveIntegerOrNull(options.max_parallel_workers),
+            maxParallelWorkers:
+              clampParallelWorkersOption(args.max_parallel_workers) ??
+              clampParallelWorkersOption(options.max_parallel_workers),
             maxVerificationRetries: nonNegativeIntegerOrNull(options.max_verification_retries),
+            executor: normalizeExecutorOption(args.executor) ?? defaultExecutorFromOptions(options),
+            trackStallReminderSeconds: stallFromArgs,
             workingDirectory: directory,
           },
         )
@@ -758,27 +866,31 @@ function teamworkToolsV2(services: {
     {
       name: "teamwork_revise",
       description:
-        "Commit a revised brief for the project that is awaiting approval. Call after the user requests changes " +
+        "Commit a revised brief for the project that is awaiting approval (or switch the executor while paused). Call after the user requests changes " +
         "through /teamwork-revise, passing the complete updated brief.",
-      input: v2ObjectSchema(BRIEF_PROPERTIES(messages), [
-        "name",
-        "objectives",
-        "requirements",
-        "verification",
-        "acceptance_criteria",
-      ]),
+      input: v2ObjectSchema(
+        {
+          ...BRIEF_PROPERTIES(messages),
+          executor: { ...EXECUTOR_ENUM, description: messages.tools.executor },
+        },
+        ["name", "objectives", "requirements", "verification", "acceptance_criteria"],
+      ),
       options: { codemode: false },
       execute: async (rawArgs, toolContext) => {
         const args = rawArgs as BriefArgs
-        const project = await updateProjectBrief(toolContext.sessionID, {
-          name: args.name,
-          objectives: args.objectives,
-          requirements: args.requirements,
-          verification: args.verification,
-          acceptanceCriteria: args.acceptance_criteria,
-          integrityMode: (args.integrity_mode ?? "development") as IntegrityMode,
-          artifactLocale: isTeamworkLocale(args.artifact_locale) ? args.artifact_locale : "en",
-        })
+        const project = await updateProjectBrief(
+          toolContext.sessionID,
+          {
+            name: args.name,
+            objectives: args.objectives,
+            requirements: args.requirements,
+            verification: args.verification,
+            acceptanceCriteria: args.acceptance_criteria,
+            integrityMode: (args.integrity_mode ?? "development") as IntegrityMode,
+            artifactLocale: isTeamworkLocale(args.artifact_locale) ? args.artifact_locale : "en",
+          },
+          { executor: normalizeExecutorOption(args.executor) },
+        )
         const artifacts = await writeArtifacts(directory, project)
         await setProjectArtifacts(toolContext.sessionID, artifacts)
         return {

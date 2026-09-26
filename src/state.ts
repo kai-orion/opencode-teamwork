@@ -18,6 +18,8 @@ export type TeamRole =
   | "auditor"
   | "successAuditor"
 
+export type ExecutorMode = "native" | "isolated"
+
 export type MilestoneStatus = "pending" | "inProgress" | "verification" | "passed" | "failed"
 export type TrackStatus = "queued" | "running" | "awaitingVerification" | "passed" | "failed"
 export type Verdict = "pass" | "fail" | "blocked"
@@ -96,6 +98,8 @@ export type CreateProjectOptions = {
   maxParallelWorkers?: number | null
   maxVerificationRetries?: number | null
   workingDirectory?: string | null
+  executor?: ExecutorMode | string | null
+  trackStallReminderSeconds?: number | null
 }
 
 export type UsageTracker = {
@@ -126,6 +130,9 @@ export type Project = {
   maxDurationSeconds: number | null
   maxParallelWorkers: number
   maxVerificationRetries: number
+  executor: ExecutorMode
+  /** Soft per-track stall reminder threshold in seconds; null disables. */
+  trackStallReminderSeconds: number | null
   planPaused: boolean
   sentinelUpdate: SentinelUpdate | null
   history: ProjectHistoryEntry[]
@@ -157,10 +164,28 @@ class StateWriteError extends Data.TaggedError("StateWriteError")<{
 
 const MAX_HISTORY_ENTRIES = 80
 const CHECKPOINT_CHAR_LIMIT = 280
-const DEFAULT_MAX_PARALLEL_WORKERS = 3
+const DEFAULT_MAX_PARALLEL_WORKERS = 5
+const MAX_PARALLEL_WORKERS_CAP = 8
 const DEFAULT_MAX_VERIFICATION_RETRIES = 2
+const DEFAULT_EXECUTOR: ExecutorMode = "native"
+const DEFAULT_TRACK_STALL_REMINDER_SECONDS = 1800
 const NULLABLE_STRING = Schema.NullOr(Schema.String)
 const NULLABLE_NUMBER = Schema.NullOr(Schema.Number)
+
+export function isExecutorMode(value: unknown): value is ExecutorMode {
+  return value === "native" || value === "isolated"
+}
+
+export function normalizeExecutorMode(value: unknown): ExecutorMode {
+  return isExecutorMode(value) ? value : DEFAULT_EXECUTOR
+}
+
+export function clampParallelWorkers(value: unknown): number {
+  const parsed = typeof value === "number" && Number.isSafeInteger(value) ? value : DEFAULT_MAX_PARALLEL_WORKERS
+  return Math.min(MAX_PARALLEL_WORKERS_CAP, Math.max(1, parsed))
+}
+
+export { DEFAULT_EXECUTOR, DEFAULT_MAX_PARALLEL_WORKERS, MAX_PARALLEL_WORKERS_CAP, DEFAULT_TRACK_STALL_REMINDER_SECONDS }
 
 const HistoryEntrySchema = Schema.Struct({
   type: Schema.Literal(
@@ -287,6 +312,10 @@ const ProjectSchema = Schema.Struct({
   maxDurationSeconds: Schema.optionalWith(NULLABLE_NUMBER, { default: () => null }),
   maxParallelWorkers: Schema.optionalWith(Schema.Number, { default: () => DEFAULT_MAX_PARALLEL_WORKERS }),
   maxVerificationRetries: Schema.optionalWith(Schema.Number, { default: () => DEFAULT_MAX_VERIFICATION_RETRIES }),
+  executor: Schema.optionalWith(Schema.Literal("native", "isolated"), { default: () => DEFAULT_EXECUTOR }),
+  trackStallReminderSeconds: Schema.optionalWith(NULLABLE_NUMBER, {
+    default: () => DEFAULT_TRACK_STALL_REMINDER_SECONDS,
+  }),
   planPaused: Schema.optionalWith(Schema.Boolean, { default: () => false }),
   sentinelUpdate: Schema.optionalWith(Schema.NullOr(SentinelUpdateSchema), { default: () => null }),
   history: Schema.optionalWith(Schema.Array(HistoryEntrySchema), { default: () => [] }),
@@ -586,10 +615,15 @@ function normalizeProject(project: Project) {
   project.sessionsSpawned = nonNegativeInteger(project.sessionsSpawned, 0)
   project.maxAutoTurns = positiveIntegerOrNull(project.maxAutoTurns)
   project.maxDurationSeconds = positiveIntegerOrNull(project.maxDurationSeconds)
-  project.maxParallelWorkers =
-    positiveIntegerOrNull(project.maxParallelWorkers) ?? DEFAULT_MAX_PARALLEL_WORKERS
+  // Legacy projects without the field follow the global default (native).
+  // New projects persist the chosen executor explicitly.
+  project.maxParallelWorkers = clampParallelWorkers(project.maxParallelWorkers)
   project.maxVerificationRetries =
     nonNegativeIntegerOrNull(project.maxVerificationRetries) ?? DEFAULT_MAX_VERIFICATION_RETRIES
+  project.executor = normalizeExecutorMode((project as { executor?: unknown }).executor)
+  const stall = (project as { trackStallReminderSeconds?: unknown }).trackStallReminderSeconds
+  project.trackStallReminderSeconds =
+    stall === null ? null : positiveIntegerOrNull(stall) ?? DEFAULT_TRACK_STALL_REMINDER_SECONDS
   project.planPaused = project.planPaused === true
   project.history = (project.history ?? []).slice(-MAX_HISTORY_ENTRIES)
   project.completionEvidence = project.completionEvidence ?? null
@@ -885,10 +919,14 @@ export async function createProject(
       sessionsSpawned: 0,
       maxAutoTurns: positiveIntegerOrNull(options?.maxAutoTurns),
       maxDurationSeconds: positiveIntegerOrNull(options?.maxDurationSeconds),
-      maxParallelWorkers:
-        positiveIntegerOrNull(options?.maxParallelWorkers) ?? DEFAULT_MAX_PARALLEL_WORKERS,
+      maxParallelWorkers: clampParallelWorkers(options?.maxParallelWorkers),
       maxVerificationRetries:
         nonNegativeIntegerOrNull(options?.maxVerificationRetries) ?? DEFAULT_MAX_VERIFICATION_RETRIES,
+      executor: normalizeExecutorMode(options?.executor),
+      trackStallReminderSeconds:
+        options?.trackStallReminderSeconds === null
+          ? null
+          : (positiveIntegerOrNull(options?.trackStallReminderSeconds) ?? DEFAULT_TRACK_STALL_REMINDER_SECONDS),
       planPaused: false,
       sentinelUpdate: null,
       history: [],
@@ -911,7 +949,7 @@ export async function createProject(
 }
 
 /** Replaces the brief while still awaiting approval (after /teamwork-revise). */
-export async function updateProjectBrief(sessionID: string, brief: Brief) {
+export async function updateProjectBrief(sessionID: string, brief: Brief, options?: { executor?: ExecutorMode | string | null }) {
   const normalizedBrief: Brief = {
     name: normalizeSlug(boundedText(brief.name, "project name", 200)),
     objectives: boundedText(brief.objectives, "project objectives"),
@@ -925,14 +963,108 @@ export async function updateProjectBrief(sessionID: string, brief: Brief) {
     const project = state.projects[sessionID]
     if (!project) throw new Error("cannot revise the project because this session has no project")
     if (isClosed(project.phase)) throw new Error("cannot revise the project because it is closed")
-    if (project.phase !== "awaitingApproval") {
+    // Executor may be switched while awaiting approval or paused; the brief
+    // itself is only editable while awaiting approval.
+    if (project.phase !== "awaitingApproval" && project.phase !== "paused") {
       throw new Error("the project brief can only be revised while awaiting approval")
     }
-    project.brief = normalizedBrief
-    project.slug = normalizedBrief.name
+    if (project.phase === "paused") {
+      if (
+        normalizedBrief.name !== project.slug ||
+        normalizedBrief.objectives !== project.brief.objectives ||
+        normalizedBrief.requirements !== project.brief.requirements ||
+        normalizedBrief.verification !== project.brief.verification ||
+        normalizedBrief.acceptanceCriteria !== project.brief.acceptanceCriteria ||
+        normalizedBrief.integrityMode !== project.brief.integrityMode ||
+        normalizedBrief.artifactLocale !== project.brief.artifactLocale
+      ) {
+        throw new Error("only the executor can be switched while paused; revise the brief while awaiting approval")
+      }
+      if (options?.executor == null) throw new Error("nothing to revise while paused: provide an executor")
+    } else {
+      project.brief = normalizedBrief
+      project.slug = normalizedBrief.name
+    }
+    if (options?.executor != null) {
+      const next = normalizeExecutorMode(options.executor)
+      if (next !== project.executor) {
+        project.executor = next
+        pushHistory(project, "updated", `Project executor switched to "${next}".`)
+      }
+    }
     project.updatedAt = nowSeconds()
-    project.lastStatus = "Project brief revised; awaiting approval."
-    pushHistory(project, "updated", `Project brief revised for "${project.slug}".`)
+    project.lastStatus = project.phase === "paused" ? "Project executor switched while paused." : "Project brief revised; awaiting approval."
+    if (project.phase !== "paused") pushHistory(project, "updated", `Project brief revised for "${project.slug}".`)
+    return snapshot(project)
+  })
+}
+
+/** Switches the executor while awaiting approval or paused (executing is immutable). */
+export async function setProjectExecutor(sessionID: string, executor: ExecutorMode | string) {
+  const next = normalizeExecutorMode(executor)
+  return mutate((state) => {
+    const project = state.projects[sessionID]
+    if (!project) throw new Error("cannot switch the executor because this session has no project")
+    if (isClosed(project.phase)) throw new Error("cannot switch the executor because it is closed")
+    if (project.phase !== "awaitingApproval" && project.phase !== "paused") {
+      throw new Error("the executor can only be switched while awaiting approval or paused")
+    }
+    if (next !== project.executor) {
+      project.executor = next
+      project.updatedAt = nowSeconds()
+      project.lastStatus = `Project executor switched to "${next}".`
+      pushHistory(project, "updated", project.lastStatus)
+    }
+    return snapshot(project)
+  })
+}
+
+/**
+ * Suspends wall-clock accounting during permission waits so approval latency
+ * does not consume the project's duration budget. The next accounting call
+ * re-anchors the timer without accruing the gap.
+ */
+export async function suspendTimerForPermission(sessionID: string) {
+  return mutate((state) => {
+    const project = state.projects[sessionID]
+    if (!project) return null
+    if (!isExecuting(project.phase)) return snapshot(project)
+    accountWallClock(project)
+    project.lastAccountedAt = null
+    project.updatedAt = nowSeconds()
+    pushHistory(project, "warning", "Permission wait started; wall-clock timer suspended.")
+    return snapshot(project)
+  })
+}
+
+/** Submits a report against a track ID (native executor path has no role session). */
+export async function submitTrackReportByID(
+  projectSessionID: string,
+  milestoneIndex: number,
+  trackID: string,
+  report: Omit<RoleReport, "submittedAt">,
+) {
+  const normalizedReport: RoleReport = {
+    role: report.role,
+    verdict: report.verdict,
+    findings: (report.findings ?? []).map((item) => boundedText(item, "report finding", 2000)).slice(0, 50),
+    evidence: (report.evidence ?? []).map((item) => boundedText(item, "report evidence", 2000)).slice(0, 50),
+    blockers: (report.blockers ?? []).map((item) => boundedText(item, "report blocker", 2000)).slice(0, 20),
+    artifactsWritten: (report.artifactsWritten ?? []).map((item) => item.trim()).filter(Boolean).slice(0, 100),
+    submittedAt: nowSeconds(),
+  }
+  return mutate((state) => {
+    const project = state.projects[projectSessionID]
+    if (!project) throw new Error("cannot submit the report because the project does not exist")
+    const milestone = project.milestones[milestoneIndex]
+    if (!milestone) throw new Error("cannot submit the report because the milestone does not exist")
+    const track = milestone.tracks.find((candidate) => candidate.id === trackID)
+    if (!track) throw new Error("cannot submit the report because the track does not exist")
+    track.lastReport = normalizedReport
+    track.status = normalizedReport.verdict === "pass" ? "passed" : normalizedReport.verdict === "fail" ? "failed" : track.status
+    project.lastStatus = `${track.role} reported: ${normalizedReport.verdict}`
+    project.updatedAt = nowSeconds()
+    pushHistory(project, "verification", `${track.role} (${milestone.id}) reported ${normalizedReport.verdict}`)
     return snapshot(project)
   })
 }
@@ -1391,9 +1523,11 @@ export function formatProject(project: ProjectSnapshot | null) {
     `Project: ${project.slug}`,
     `Phase: ${project.phase}`,
     `Integrity mode: ${project.brief.integrityMode}`,
+    `Executor: ${project.executor ?? "native"}`,
     `Milestones: ${project.milestones.length}${
       project.activeMilestoneIndex >= 0 ? ` (active: m${project.activeMilestoneIndex + 1})` : ""
     }`,
+    `Parallel workers: ${project.maxParallelWorkers}`,
     `Time used: ${project.timeUsedSeconds}s`,
     `Tokens used: ${project.tokensUsed}${project.tokenBudget == null ? "" : `/${project.tokenBudget}`}`,
   ]

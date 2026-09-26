@@ -142,10 +142,12 @@ export function milestoneProgress(project: ProjectSnapshot) {
 
 export function formatProjectSummary(project: ProjectSnapshot | null, messages: TeamworkMessages, locale: TeamworkLocale) {
   if (!project) return messages.tui.noProject
+  const executor = (project as { executor?: string }).executor ?? "native"
   const lines = [
     `${messages.tui.project}: ${project.slug}`,
     `${messages.tui.phase}: ${presentPhase(project.phase, locale)}`,
     `${messages.tui.integrity}: ${presentIntegrityMode(project.brief.integrityMode, locale)}`,
+    `Executor: ${executor} | workers: ${(project as { maxParallelWorkers?: number }).maxParallelWorkers ?? 5}`,
     `${messages.tui.milestoneProgress}: ${milestoneProgress(project)}${
       project.activeMilestoneIndex >= 0 ? ` (m${project.activeMilestoneIndex + 1})` : ""
     }`,

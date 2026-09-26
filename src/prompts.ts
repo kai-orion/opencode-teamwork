@@ -150,6 +150,7 @@ export type RoleTaskInput = {
   assignedFiles: string[]
   scratchDirectory: string | null
   attemptContext: string | null
+  executorMode?: string | null
 }
 
 export function roleTaskPrompt(input: RoleTaskInput) {
@@ -159,6 +160,7 @@ export function roleTaskPrompt(input: RoleTaskInput) {
     `Project: ${input.projectSlug}`,
     `Working directory: ${input.workingDirectory}`,
     `Integrity mode: ${input.integrityMode}`,
+    `Executor: ${input.executorMode ?? "native"}`,
     `Your role: ${input.role}`,
     ``,
     `### Task`,
@@ -189,6 +191,15 @@ export function roleTaskPrompt(input: RoleTaskInput) {
   if (input.attemptContext) {
     lines.push(``, `### Prior attempt context`, input.attemptContext)
   }
+  if ((input.executorMode ?? "native") === "native") {
+    lines.push(
+      ``,
+      `### Native execution notes`,
+      `You may fan out with the model's native subagents inside this task to work faster.`,
+      `Isolation is prompt-level only: respect assigned_files exclusive ownership, keep probe files inside the scratch directory, and never rewrite evidence.`,
+      `Evidence must be verbatim command output you actually ran; the Auditor will rerun your commands.`,
+    )
+  }
   lines.push(
     ``,
     `### Reporting`,
@@ -199,6 +210,112 @@ export function roleTaskPrompt(input: RoleTaskInput) {
     `- blockers: anything preventing the task from proceeding (empty if none)`,
     `- artifactsWritten: files you created or modified (empty if read-only)`,
     `A session that ends without submitting the report is treated as a failed task.`,
+  )
+  return lines.join("\n")
+}
+
+/** Short per-track broadcast sent to the main session after each report lands. */
+export function trackSummaryPrompt(input: {
+  locale: TeamworkLocale
+  projectSlug: string
+  trackID: string
+  role: string
+  title: string
+  verdict: string
+  findings: string[]
+  evidence: string[]
+  running: number
+  queued: number
+}) {
+  const header =
+    input.locale === "zh-CN"
+      ? `【Teamwork 進展】${input.projectSlug} ${input.trackID}（${input.role}）${input.verdict}：${input.title}`
+      : input.locale === "zh-TW"
+        ? `【Teamwork 進展】${input.projectSlug} ${input.trackID}（${input.role}）${input.verdict}：${input.title}`
+        : `[Teamwork progress] ${input.projectSlug} ${input.trackID} (${input.role}) ${input.verdict}: ${input.title}`
+  const lines = [header]
+  for (const finding of input.findings.slice(0, 3)) lines.push(`- finding: ${finding}`)
+  for (const evidence of input.evidence.slice(0, 3)) {
+    const excerpt = evidence.length > 220 ? `${evidence.slice(0, 217)}...` : evidence
+    lines.push(`- evidence: ${excerpt}`)
+  }
+  lines.push(`- queue: running ${input.running}, queued ${input.queued}`)
+  lines.push(`Full details are in progress.md; the team continues autonomously.`)
+  return lines.join("\n")
+}
+
+/** Permission-wait alarm sent to the main session; timer is suspended. */
+export function permissionApprovalPrompt(input: {
+  locale: TeamworkLocale
+  projectSlug: string
+  trackID: string
+  role: string
+  detail: string
+}) {
+  const header =
+    input.locale === "zh-CN"
+      ? `[NEEDS-APPROVAL]【Teamwork Sentinel】项目「${input.projectSlug}」${input.trackID}（${input.role}）等待权限批准`
+      : input.locale === "zh-TW"
+        ? `[NEEDS-APPROVAL]【Teamwork Sentinel】專案「${input.projectSlug}」${input.trackID}（${input.role}）等待權限批准`
+        : `[NEEDS-APPROVAL] [Teamwork Sentinel] Project "${input.projectSlug}" ${input.trackID} (${input.role}) is waiting for permission approval`
+  return [
+    header,
+    input.detail,
+    input.locale === "en"
+      ? "Approve or deny the pending permission in the host, then the team resumes. Wall-clock accounting is suspended while waiting."
+      : "請在 host 中批准或拒絕待批權限，團隊會隨後繼續。等待期間不計入項目耗時。",
+  ].join("\n")
+}
+
+/** Native batch prompt: one main-session prompt covering a whole phase batch. */
+export function nativeBatchPrompt(input: {
+  projectSlug: string
+  workingDirectory: string
+  artifactPaths: { request: string; plan: string; progress: string } | null
+  integrityMode: string
+  milestoneID: string
+  milestoneTitle: string
+  milestoneDescription: string
+  tracks: Array<{ id: string; title: string; role: string; assignedFiles: string[]; scratch: string | null }>
+}) {
+  const lines = [
+    `## Teamwork native execution batch`,
+    ``,
+    `Project: ${input.projectSlug}`,
+    `Working directory: ${input.workingDirectory}`,
+    `Integrity mode: ${input.integrityMode}`,
+    `Milestone: ${input.milestoneID} — ${input.milestoneTitle}`,
+    ``,
+    input.milestoneDescription,
+    ``,
+    `Execute every track below with the model's native subagents IN PARALLEL (fan out, do not run them one by one).`,
+    `Isolation is prompt-level only: respect each track's exclusive assigned_files, keep probe files inside the scratch directory, and never modify project sources except from the matching worker track.`,
+    ``,
+  ]
+  for (const track of input.tracks) {
+    lines.push(`### Track ${track.id} (${track.role}): ${track.title}`)
+    if (track.assignedFiles.length > 0) lines.push(`Assigned files: ${track.assignedFiles.join(", ")}`)
+    if (track.scratch) lines.push(`Scratch: ${track.scratch}`)
+    lines.push(``)
+  }
+  if (input.artifactPaths) {
+    lines.push(
+      `Project artifacts:`,
+      `- Request: ${input.artifactPaths.request}`,
+      `- Plan: ${input.artifactPaths.plan}`,
+      `- Progress: ${input.artifactPaths.progress}`,
+      `Read the request artifact first.`,
+      ``,
+    )
+  }
+  lines.push(
+    `### Reporting (mandatory, one call per track)`,
+    `After the native fan-out finishes, call the teamwork_report tool ONCE PER TRACK with the track's role:`,
+    `- verdict: "pass" | "fail" | "blocked"`,
+    `- findings: concrete findings (verbatim from the subagent that ran the track)`,
+    `- evidence: VERBATIM command output the subagent actually ran (do not rewrite or summarize); the Auditor will rerun these commands`,
+    `- blockers / artifactsWritten as usual`,
+    `A track without its own teamwork_report call is treated as failed. Do not batch multiple tracks into one report call.`,
   )
   return lines.join("\n")
 }
@@ -223,8 +340,10 @@ export function teamworkCommandTemplate(locale: TeamworkLocale) {
       "4. 驗收標準：定義明確、可測試的完成標準。",
       "5. 工作目錄確認：顯示目前 repo 路徑並請使用者確認（專案將在此 repo 執行，不可改到其他目錄）。",
       "6. 完整性模式：詢問哪些捷徑不可接受，據此映射為 development／demo／benchmark。",
+      "7. 執行器：詢問 native 還是 isolated（預設 native；native 快、隔離為 prompt 級，門禁不變、evidence 須貼原始輸出）。",
+      "8. 並行度：詢問同 phase 最大並行 track 數（預設 5，上限 8）。",
       "",
-      "面談收斂後，呼叫 teamwork_create_project 工具提交結構化 brief，並向使用者展示回傳的 artifact 路徑，",
+      "面談收斂後，呼叫 teamwork_create_project 工具提交結構化 brief（含 executor 與 max_parallel_workers），並向使用者展示回傳的 artifact 路徑，",
       "請使用者以 /teamwork-approve 批准，或以 /teamwork-revise 修改。批准前不要做任何實作工作。",
     ].join("\n")
   }
@@ -243,8 +362,10 @@ export function teamworkCommandTemplate(locale: TeamworkLocale) {
       "4. 驗收標準：定義明確、可測試的完成標準。",
       "5. 工作目錄確認：顯示目前 repo 路徑並請使用者確認（專案將在此 repo 執行，不可改到其他目錄）。",
       "6. 完整性模式：詢問哪些捷徑不可接受，據此映射為 development／demo／benchmark。",
+      "7. 執行器：詢問 native 還是 isolated（預設 native；native 快、隔離為 prompt 級，門禁不變、evidence 須貼原始輸出）。",
+      "8. 並行度：詢問同 phase 最大並行 track 數（預設 5，上限 8）。",
       "",
-      "面談收斂後，呼叫 teamwork_create_project 工具提交結構化 brief，並向使用者展示回傳的 artifact 路徑，",
+      "面談收斂後，呼叫 teamwork_create_project 工具提交結構化 brief（含 executor 與 max_parallel_workers），並向使用者展示回傳的 artifact 路徑，",
       "請使用者以 /teamwork-approve 批准，或以 /teamwork-revise 修改。批准前不要做任何實作工作。",
     ].join("\n")
   }
@@ -264,8 +385,10 @@ export function teamworkCommandTemplate(locale: TeamworkLocale) {
     "5. Working directory confirmation: show the current repo path and ask the user to confirm it (the project runs",
     "   in this repo; do not offer a different directory).",
     "6. Integrity mode: ask which shortcuts are off-limits and map the answers to development / demo / benchmark.",
+    "7. Executor: ask native vs isolated (default native; native is fast with prompt-level isolation, gates stay strict, evidence must be verbatim).",
+    "8. Parallelism: ask for max parallel tracks within a phase (default 5, cap 8).",
     "",
-    "After the interview converges, call the teamwork_create_project tool with the structured brief, then show the",
+    "After the interview converges, call the teamwork_create_project tool with the structured brief (including executor",
     "returned artifact paths and ask the user to approve with /teamwork-approve or revise with /teamwork-revise.",
     "Do not start any implementation work before approval.",
   ].join("\n")

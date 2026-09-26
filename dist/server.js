@@ -128,10 +128,23 @@ class StateWriteError extends Data.TaggedError("StateWriteError") {
 }
 var MAX_HISTORY_ENTRIES = 80;
 var CHECKPOINT_CHAR_LIMIT = 280;
-var DEFAULT_MAX_PARALLEL_WORKERS = 3;
+var DEFAULT_MAX_PARALLEL_WORKERS = 5;
+var MAX_PARALLEL_WORKERS_CAP = 8;
 var DEFAULT_MAX_VERIFICATION_RETRIES = 2;
+var DEFAULT_EXECUTOR = "native";
+var DEFAULT_TRACK_STALL_REMINDER_SECONDS = 1800;
 var NULLABLE_STRING = Schema.NullOr(Schema.String);
 var NULLABLE_NUMBER = Schema.NullOr(Schema.Number);
+function isExecutorMode(value) {
+  return value === "native" || value === "isolated";
+}
+function normalizeExecutorMode(value) {
+  return isExecutorMode(value) ? value : DEFAULT_EXECUTOR;
+}
+function clampParallelWorkers(value) {
+  const parsed = typeof value === "number" && Number.isSafeInteger(value) ? value : DEFAULT_MAX_PARALLEL_WORKERS;
+  return Math.min(MAX_PARALLEL_WORKERS_CAP, Math.max(1, parsed));
+}
 var HistoryEntrySchema = Schema.Struct({
   type: Schema.Literal("created", "updated", "artifact", "approved", "paused", "resumed", "milestone", "verification", "completed", "cancelled", "warning", "limited", "error"),
   detail: Schema.String,
@@ -208,6 +221,10 @@ var ProjectSchema = Schema.Struct({
   maxDurationSeconds: Schema.optionalWith(NULLABLE_NUMBER, { default: () => null }),
   maxParallelWorkers: Schema.optionalWith(Schema.Number, { default: () => DEFAULT_MAX_PARALLEL_WORKERS }),
   maxVerificationRetries: Schema.optionalWith(Schema.Number, { default: () => DEFAULT_MAX_VERIFICATION_RETRIES }),
+  executor: Schema.optionalWith(Schema.Literal("native", "isolated"), { default: () => DEFAULT_EXECUTOR }),
+  trackStallReminderSeconds: Schema.optionalWith(NULLABLE_NUMBER, {
+    default: () => DEFAULT_TRACK_STALL_REMINDER_SECONDS
+  }),
   planPaused: Schema.optionalWith(Schema.Boolean, { default: () => false }),
   sentinelUpdate: Schema.optionalWith(Schema.NullOr(SentinelUpdateSchema), { default: () => null }),
   history: Schema.optionalWith(Schema.Array(HistoryEntrySchema), { default: () => [] }),
@@ -419,8 +436,11 @@ function normalizeProject(project) {
   project.sessionsSpawned = nonNegativeInteger(project.sessionsSpawned, 0);
   project.maxAutoTurns = positiveIntegerOrNull(project.maxAutoTurns);
   project.maxDurationSeconds = positiveIntegerOrNull(project.maxDurationSeconds);
-  project.maxParallelWorkers = positiveIntegerOrNull(project.maxParallelWorkers) ?? DEFAULT_MAX_PARALLEL_WORKERS;
+  project.maxParallelWorkers = clampParallelWorkers(project.maxParallelWorkers);
   project.maxVerificationRetries = nonNegativeIntegerOrNull(project.maxVerificationRetries) ?? DEFAULT_MAX_VERIFICATION_RETRIES;
+  project.executor = normalizeExecutorMode(project.executor);
+  const stall = project.trackStallReminderSeconds;
+  project.trackStallReminderSeconds = stall === null ? null : positiveIntegerOrNull(stall) ?? DEFAULT_TRACK_STALL_REMINDER_SECONDS;
   project.planPaused = project.planPaused === true;
   project.history = (project.history ?? []).slice(-MAX_HISTORY_ENTRIES);
   project.completionEvidence = project.completionEvidence ?? null;
@@ -642,8 +662,10 @@ async function createProject(sessionID, brief, options, agent) {
       sessionsSpawned: 0,
       maxAutoTurns: positiveIntegerOrNull(options?.maxAutoTurns),
       maxDurationSeconds: positiveIntegerOrNull(options?.maxDurationSeconds),
-      maxParallelWorkers: positiveIntegerOrNull(options?.maxParallelWorkers) ?? DEFAULT_MAX_PARALLEL_WORKERS,
+      maxParallelWorkers: clampParallelWorkers(options?.maxParallelWorkers),
       maxVerificationRetries: nonNegativeIntegerOrNull(options?.maxVerificationRetries) ?? DEFAULT_MAX_VERIFICATION_RETRIES,
+      executor: normalizeExecutorMode(options?.executor),
+      trackStallReminderSeconds: options?.trackStallReminderSeconds === null ? null : positiveIntegerOrNull(options?.trackStallReminderSeconds) ?? DEFAULT_TRACK_STALL_REMINDER_SECONDS,
       planPaused: false,
       sentinelUpdate: null,
       history: [],
@@ -662,7 +684,7 @@ async function createProject(sessionID, brief, options, agent) {
     return snapshot(project);
   });
 }
-async function updateProjectBrief(sessionID, brief) {
+async function updateProjectBrief(sessionID, brief, options) {
   const normalizedBrief = {
     name: normalizeSlug(boundedText(brief.name, "project name", 200)),
     objectives: boundedText(brief.objectives, "project objectives"),
@@ -678,14 +700,72 @@ async function updateProjectBrief(sessionID, brief) {
       throw new Error("cannot revise the project because this session has no project");
     if (isClosed(project.phase))
       throw new Error("cannot revise the project because it is closed");
-    if (project.phase !== "awaitingApproval") {
+    if (project.phase !== "awaitingApproval" && project.phase !== "paused") {
       throw new Error("the project brief can only be revised while awaiting approval");
     }
-    project.brief = normalizedBrief;
-    project.slug = normalizedBrief.name;
+    if (project.phase === "paused") {
+      if (normalizedBrief.name !== project.slug || normalizedBrief.objectives !== project.brief.objectives || normalizedBrief.requirements !== project.brief.requirements || normalizedBrief.verification !== project.brief.verification || normalizedBrief.acceptanceCriteria !== project.brief.acceptanceCriteria || normalizedBrief.integrityMode !== project.brief.integrityMode || normalizedBrief.artifactLocale !== project.brief.artifactLocale) {
+        throw new Error("only the executor can be switched while paused; revise the brief while awaiting approval");
+      }
+      if (options?.executor == null)
+        throw new Error("nothing to revise while paused: provide an executor");
+    } else {
+      project.brief = normalizedBrief;
+      project.slug = normalizedBrief.name;
+    }
+    if (options?.executor != null) {
+      const next = normalizeExecutorMode(options.executor);
+      if (next !== project.executor) {
+        project.executor = next;
+        pushHistory(project, "updated", `Project executor switched to "${next}".`);
+      }
+    }
     project.updatedAt = nowSeconds();
-    project.lastStatus = "Project brief revised; awaiting approval.";
-    pushHistory(project, "updated", `Project brief revised for "${project.slug}".`);
+    project.lastStatus = project.phase === "paused" ? "Project executor switched while paused." : "Project brief revised; awaiting approval.";
+    if (project.phase !== "paused")
+      pushHistory(project, "updated", `Project brief revised for "${project.slug}".`);
+    return snapshot(project);
+  });
+}
+async function suspendTimerForPermission(sessionID) {
+  return mutate((state) => {
+    const project = state.projects[sessionID];
+    if (!project)
+      return null;
+    if (!isExecuting(project.phase))
+      return snapshot(project);
+    accountWallClock(project);
+    project.lastAccountedAt = null;
+    project.updatedAt = nowSeconds();
+    pushHistory(project, "warning", "Permission wait started; wall-clock timer suspended.");
+    return snapshot(project);
+  });
+}
+async function submitTrackReportByID(projectSessionID, milestoneIndex, trackID, report) {
+  const normalizedReport = {
+    role: report.role,
+    verdict: report.verdict,
+    findings: (report.findings ?? []).map((item) => boundedText(item, "report finding", 2000)).slice(0, 50),
+    evidence: (report.evidence ?? []).map((item) => boundedText(item, "report evidence", 2000)).slice(0, 50),
+    blockers: (report.blockers ?? []).map((item) => boundedText(item, "report blocker", 2000)).slice(0, 20),
+    artifactsWritten: (report.artifactsWritten ?? []).map((item) => item.trim()).filter(Boolean).slice(0, 100),
+    submittedAt: nowSeconds()
+  };
+  return mutate((state) => {
+    const project = state.projects[projectSessionID];
+    if (!project)
+      throw new Error("cannot submit the report because the project does not exist");
+    const milestone = project.milestones[milestoneIndex];
+    if (!milestone)
+      throw new Error("cannot submit the report because the milestone does not exist");
+    const track = milestone.tracks.find((candidate) => candidate.id === trackID);
+    if (!track)
+      throw new Error("cannot submit the report because the track does not exist");
+    track.lastReport = normalizedReport;
+    track.status = normalizedReport.verdict === "pass" ? "passed" : normalizedReport.verdict === "fail" ? "failed" : track.status;
+    project.lastStatus = `${track.role} reported: ${normalizedReport.verdict}`;
+    project.updatedAt = nowSeconds();
+    pushHistory(project, "verification", `${track.role} (${milestone.id}) reported ${normalizedReport.verdict}`);
     return snapshot(project);
   });
 }
@@ -1061,7 +1141,9 @@ function formatProject(project) {
     `Project: ${project.slug}`,
     `Phase: ${project.phase}`,
     `Integrity mode: ${project.brief.integrityMode}`,
+    `Executor: ${project.executor ?? "native"}`,
     `Milestones: ${project.milestones.length}${project.activeMilestoneIndex >= 0 ? ` (active: m${project.activeMilestoneIndex + 1})` : ""}`,
+    `Parallel workers: ${project.maxParallelWorkers}`,
     `Time used: ${project.timeUsedSeconds}s`,
     `Tokens used: ${project.tokensUsed}${project.tokenBudget == null ? "" : `/${project.tokenBudget}`}`
   ];
@@ -1233,6 +1315,7 @@ function roleTaskPrompt(input) {
     `Project: ${input.projectSlug}`,
     `Working directory: ${input.workingDirectory}`,
     `Integrity mode: ${input.integrityMode}`,
+    `Executor: ${input.executorMode ?? "native"}`,
     `Your role: ${input.role}`,
     ``,
     `### Task`,
@@ -1252,7 +1335,63 @@ function roleTaskPrompt(input) {
   if (input.attemptContext) {
     lines.push(``, `### Prior attempt context`, input.attemptContext);
   }
+  if ((input.executorMode ?? "native") === "native") {
+    lines.push(``, `### Native execution notes`, `You may fan out with the model's native subagents inside this task to work faster.`, `Isolation is prompt-level only: respect assigned_files exclusive ownership, keep probe files inside the scratch directory, and never rewrite evidence.`, `Evidence must be verbatim command output you actually ran; the Auditor will rerun your commands.`);
+  }
   lines.push(``, `### Reporting`, `Before your session ends you MUST call the teamwork_report tool with your structured report:`, `- verdict: "pass", "fail", or "blocked"`, `- findings: concrete findings from your pass`, `- evidence: concrete evidence (commands you ran and their real output, file:line references)`, `- blockers: anything preventing the task from proceeding (empty if none)`, `- artifactsWritten: files you created or modified (empty if read-only)`, `A session that ends without submitting the report is treated as a failed task.`);
+  return lines.join(`
+`);
+}
+function trackSummaryPrompt(input) {
+  const header = input.locale === "zh-CN" ? `\u3010Teamwork \u9032\u5C55\u3011${input.projectSlug} ${input.trackID}\uFF08${input.role}\uFF09${input.verdict}\uFF1A${input.title}` : input.locale === "zh-TW" ? `\u3010Teamwork \u9032\u5C55\u3011${input.projectSlug} ${input.trackID}\uFF08${input.role}\uFF09${input.verdict}\uFF1A${input.title}` : `[Teamwork progress] ${input.projectSlug} ${input.trackID} (${input.role}) ${input.verdict}: ${input.title}`;
+  const lines = [header];
+  for (const finding of input.findings.slice(0, 3))
+    lines.push(`- finding: ${finding}`);
+  for (const evidence of input.evidence.slice(0, 3)) {
+    const excerpt = evidence.length > 220 ? `${evidence.slice(0, 217)}...` : evidence;
+    lines.push(`- evidence: ${excerpt}`);
+  }
+  lines.push(`- queue: running ${input.running}, queued ${input.queued}`);
+  lines.push(`Full details are in progress.md; the team continues autonomously.`);
+  return lines.join(`
+`);
+}
+function permissionApprovalPrompt(input) {
+  const header = input.locale === "zh-CN" ? `[NEEDS-APPROVAL]\u3010Teamwork Sentinel\u3011\u9879\u76EE\u300C${input.projectSlug}\u300D${input.trackID}\uFF08${input.role}\uFF09\u7B49\u5F85\u6743\u9650\u6279\u51C6` : input.locale === "zh-TW" ? `[NEEDS-APPROVAL]\u3010Teamwork Sentinel\u3011\u5C08\u6848\u300C${input.projectSlug}\u300D${input.trackID}\uFF08${input.role}\uFF09\u7B49\u5F85\u6B0A\u9650\u6279\u51C6` : `[NEEDS-APPROVAL] [Teamwork Sentinel] Project "${input.projectSlug}" ${input.trackID} (${input.role}) is waiting for permission approval`;
+  return [
+    header,
+    input.detail,
+    input.locale === "en" ? "Approve or deny the pending permission in the host, then the team resumes. Wall-clock accounting is suspended while waiting." : "\u8ACB\u5728 host \u4E2D\u6279\u51C6\u6216\u62D2\u7D55\u5F85\u6279\u6B0A\u9650\uFF0C\u5718\u968A\u6703\u96A8\u5F8C\u7E7C\u7E8C\u3002\u7B49\u5F85\u671F\u9593\u4E0D\u8A08\u5165\u9805\u76EE\u8017\u6642\u3002"
+  ].join(`
+`);
+}
+function nativeBatchPrompt(input) {
+  const lines = [
+    `## Teamwork native execution batch`,
+    ``,
+    `Project: ${input.projectSlug}`,
+    `Working directory: ${input.workingDirectory}`,
+    `Integrity mode: ${input.integrityMode}`,
+    `Milestone: ${input.milestoneID} \u2014 ${input.milestoneTitle}`,
+    ``,
+    input.milestoneDescription,
+    ``,
+    `Execute every track below with the model's native subagents IN PARALLEL (fan out, do not run them one by one).`,
+    `Isolation is prompt-level only: respect each track's exclusive assigned_files, keep probe files inside the scratch directory, and never modify project sources except from the matching worker track.`,
+    ``
+  ];
+  for (const track of input.tracks) {
+    lines.push(`### Track ${track.id} (${track.role}): ${track.title}`);
+    if (track.assignedFiles.length > 0)
+      lines.push(`Assigned files: ${track.assignedFiles.join(", ")}`);
+    if (track.scratch)
+      lines.push(`Scratch: ${track.scratch}`);
+    lines.push(``);
+  }
+  if (input.artifactPaths) {
+    lines.push(`Project artifacts:`, `- Request: ${input.artifactPaths.request}`, `- Plan: ${input.artifactPaths.plan}`, `- Progress: ${input.artifactPaths.progress}`, `Read the request artifact first.`, ``);
+  }
+  lines.push(`### Reporting (mandatory, one call per track)`, `After the native fan-out finishes, call the teamwork_report tool ONCE PER TRACK with the track's role:`, `- verdict: "pass" | "fail" | "blocked"`, `- findings: concrete findings (verbatim from the subagent that ran the track)`, `- evidence: VERBATIM command output the subagent actually ran (do not rewrite or summarize); the Auditor will rerun these commands`, `- blockers / artifactsWritten as usual`, `A track without its own teamwork_report call is treated as failed. Do not batch multiple tracks into one report call.`);
   return lines.join(`
 `);
 }
@@ -1272,8 +1411,10 @@ function teamworkCommandTemplate(locale) {
       "4. \u9A57\u6536\u6A19\u6E96\uFF1A\u5B9A\u7FA9\u660E\u78BA\u3001\u53EF\u6E2C\u8A66\u7684\u5B8C\u6210\u6A19\u6E96\u3002",
       "5. \u5DE5\u4F5C\u76EE\u9304\u78BA\u8A8D\uFF1A\u986F\u793A\u76EE\u524D repo \u8DEF\u5F91\u4E26\u8ACB\u4F7F\u7528\u8005\u78BA\u8A8D\uFF08\u5C08\u6848\u5C07\u5728\u6B64 repo \u57F7\u884C\uFF0C\u4E0D\u53EF\u6539\u5230\u5176\u4ED6\u76EE\u9304\uFF09\u3002",
       "6. \u5B8C\u6574\u6027\u6A21\u5F0F\uFF1A\u8A62\u554F\u54EA\u4E9B\u6377\u5F91\u4E0D\u53EF\u63A5\u53D7\uFF0C\u64DA\u6B64\u6620\u5C04\u70BA development\uFF0Fdemo\uFF0Fbenchmark\u3002",
+      "7. \u57F7\u884C\u5668\uFF1A\u8A62\u554F native \u9084\u662F isolated\uFF08\u9810\u8A2D native\uFF1Bnative \u5FEB\u3001\u9694\u96E2\u70BA prompt \u7D1A\uFF0C\u9580\u7981\u4E0D\u8B8A\u3001evidence \u9808\u8CBC\u539F\u59CB\u8F38\u51FA\uFF09\u3002",
+      "8. \u4E26\u884C\u5EA6\uFF1A\u8A62\u554F\u540C phase \u6700\u5927\u4E26\u884C track \u6578\uFF08\u9810\u8A2D 5\uFF0C\u4E0A\u9650 8\uFF09\u3002",
       "",
-      "\u9762\u8AC7\u6536\u6582\u5F8C\uFF0C\u547C\u53EB teamwork_create_project \u5DE5\u5177\u63D0\u4EA4\u7D50\u69CB\u5316 brief\uFF0C\u4E26\u5411\u4F7F\u7528\u8005\u5C55\u793A\u56DE\u50B3\u7684 artifact \u8DEF\u5F91\uFF0C",
+      "\u9762\u8AC7\u6536\u6582\u5F8C\uFF0C\u547C\u53EB teamwork_create_project \u5DE5\u5177\u63D0\u4EA4\u7D50\u69CB\u5316 brief\uFF08\u542B executor \u8207 max_parallel_workers\uFF09\uFF0C\u4E26\u5411\u4F7F\u7528\u8005\u5C55\u793A\u56DE\u50B3\u7684 artifact \u8DEF\u5F91\uFF0C",
       "\u8ACB\u4F7F\u7528\u8005\u4EE5 /teamwork-approve \u6279\u51C6\uFF0C\u6216\u4EE5 /teamwork-revise \u4FEE\u6539\u3002\u6279\u51C6\u524D\u4E0D\u8981\u505A\u4EFB\u4F55\u5BE6\u4F5C\u5DE5\u4F5C\u3002"
     ].join(`
 `);
@@ -1293,8 +1434,10 @@ function teamworkCommandTemplate(locale) {
       "4. \u9A57\u6536\u6A19\u6E96\uFF1A\u5B9A\u7FA9\u660E\u78BA\u3001\u53EF\u6E2C\u8A66\u7684\u5B8C\u6210\u6A19\u6E96\u3002",
       "5. \u5DE5\u4F5C\u76EE\u9304\u78BA\u8A8D\uFF1A\u986F\u793A\u76EE\u524D repo \u8DEF\u5F91\u4E26\u8ACB\u4F7F\u7528\u8005\u78BA\u8A8D\uFF08\u5C08\u6848\u5C07\u5728\u6B64 repo \u57F7\u884C\uFF0C\u4E0D\u53EF\u6539\u5230\u5176\u4ED6\u76EE\u9304\uFF09\u3002",
       "6. \u5B8C\u6574\u6027\u6A21\u5F0F\uFF1A\u8A62\u554F\u54EA\u4E9B\u6377\u5F91\u4E0D\u53EF\u63A5\u53D7\uFF0C\u64DA\u6B64\u6620\u5C04\u70BA development\uFF0Fdemo\uFF0Fbenchmark\u3002",
+      "7. \u57F7\u884C\u5668\uFF1A\u8A62\u554F native \u9084\u662F isolated\uFF08\u9810\u8A2D native\uFF1Bnative \u5FEB\u3001\u9694\u96E2\u70BA prompt \u7D1A\uFF0C\u9580\u7981\u4E0D\u8B8A\u3001evidence \u9808\u8CBC\u539F\u59CB\u8F38\u51FA\uFF09\u3002",
+      "8. \u4E26\u884C\u5EA6\uFF1A\u8A62\u554F\u540C phase \u6700\u5927\u4E26\u884C track \u6578\uFF08\u9810\u8A2D 5\uFF0C\u4E0A\u9650 8\uFF09\u3002",
       "",
-      "\u9762\u8AC7\u6536\u6582\u5F8C\uFF0C\u547C\u53EB teamwork_create_project \u5DE5\u5177\u63D0\u4EA4\u7D50\u69CB\u5316 brief\uFF0C\u4E26\u5411\u4F7F\u7528\u8005\u5C55\u793A\u56DE\u50B3\u7684 artifact \u8DEF\u5F91\uFF0C",
+      "\u9762\u8AC7\u6536\u6582\u5F8C\uFF0C\u547C\u53EB teamwork_create_project \u5DE5\u5177\u63D0\u4EA4\u7D50\u69CB\u5316 brief\uFF08\u542B executor \u8207 max_parallel_workers\uFF09\uFF0C\u4E26\u5411\u4F7F\u7528\u8005\u5C55\u793A\u56DE\u50B3\u7684 artifact \u8DEF\u5F91\uFF0C",
       "\u8ACB\u4F7F\u7528\u8005\u4EE5 /teamwork-approve \u6279\u51C6\uFF0C\u6216\u4EE5 /teamwork-revise \u4FEE\u6539\u3002\u6279\u51C6\u524D\u4E0D\u8981\u505A\u4EFB\u4F55\u5BE6\u4F5C\u5DE5\u4F5C\u3002"
     ].join(`
 `);
@@ -1315,8 +1458,10 @@ function teamworkCommandTemplate(locale) {
     "5. Working directory confirmation: show the current repo path and ask the user to confirm it (the project runs",
     "   in this repo; do not offer a different directory).",
     "6. Integrity mode: ask which shortcuts are off-limits and map the answers to development / demo / benchmark.",
+    "7. Executor: ask native vs isolated (default native; native is fast with prompt-level isolation, gates stay strict, evidence must be verbatim).",
+    "8. Parallelism: ask for max parallel tracks within a phase (default 5, cap 8).",
     "",
-    "After the interview converges, call the teamwork_create_project tool with the structured brief, then show the",
+    "After the interview converges, call the teamwork_create_project tool with the structured brief (including executor",
     "returned artifact paths and ask the user to approve with /teamwork-approve or revise with /teamwork-revise.",
     "Do not start any implementation work before approval."
   ].join(`
@@ -1521,36 +1666,43 @@ var LABELS = {
 function labels(locale) {
   return LABELS[locale] ?? LABELS.en;
 }
+var EXECUTOR_LABEL = {
+  en: "Executor",
+  "zh-TW": "\u57F7\u884C\u5668",
+  "zh-CN": "\u6267\u884C\u5668"
+};
+var PARALLEL_LABEL = {
+  en: "Max parallel workers",
+  "zh-TW": "\u6700\u5927\u4E26\u884C\u6578",
+  "zh-CN": "\u6700\u5927\u5E76\u884C\u6570"
+};
+var NATIVE_NOTE = {
+  en: "Native mode: prompt-level isolation only. Evidence must be verbatim command output; the Auditor reruns commands. Gates stay strict.",
+  "zh-TW": "Native \u6A21\u5F0F\uFF1A\u50C5 prompt \u7D1A\u9694\u96E2\u3002Evidence \u5FC5\u9808\u662F\u539F\u59CB\u547D\u4EE4\u8F38\u51FA\u8CBC\u4E0A\uFF1BAuditor \u6703\u91CD\u8DD1\u547D\u4EE4\u3002\u9580\u7981\u5F37\u5EA6\u4E0D\u8B8A\u3002",
+  "zh-CN": "Native \u6A21\u5F0F\uFF1A\u4EC5 prompt \u7EA7\u9694\u79BB\u3002Evidence \u5FC5\u987B\u662F\u539F\u59CB\u547D\u4EE4\u8F93\u51FA\u7C98\u8D34\uFF1BAuditor \u4F1A\u91CD\u8DD1\u547D\u4EE4\u3002\u95E8\u7981\u5F3A\u5EA6\u4E0D\u53D8\u3002"
+};
 function iso(timestamp) {
   return new Date(timestamp * 1000).toISOString();
 }
 function renderRequestArtifact(project) {
   const label = labels(project.brief.artifactLocale);
-  return [
+  const executor = project.executor ?? "native";
+  const parallel = project.maxParallelWorkers ?? 5;
+  const lines = [
     `# ${label.title}: ${project.slug}`,
     "",
     `- ${label.project}: ${project.slug}`,
     `- ${label.workingDirectory}: ${project.workingDirectory ?? "n/a"}`,
     `- ${label.integrityMode}: ${project.brief.integrityMode}`,
+    `- ${EXECUTOR_LABEL[project.brief.artifactLocale]}: ${executor}`,
+    `- ${PARALLEL_LABEL[project.brief.artifactLocale]}: ${parallel}`,
     `- ${label.status}: ${project.phase}`,
-    "",
-    `## ${label.objectives}`,
-    "",
-    project.brief.objectives,
-    "",
-    `## ${label.requirements}`,
-    "",
-    project.brief.requirements,
-    "",
-    `## ${label.verification}`,
-    "",
-    project.brief.verification,
-    "",
-    `## ${label.acceptanceCriteria}`,
-    "",
-    project.brief.acceptanceCriteria,
     ""
-  ].join(`
+  ];
+  if (executor === "native")
+    lines.push(`${NATIVE_NOTE[project.brief.artifactLocale]}`, "");
+  lines.push(`## ${label.objectives}`, "", project.brief.objectives, "", `## ${label.requirements}`, "", project.brief.requirements, "", `## ${label.verification}`, "", project.brief.verification, "", `## ${label.acceptanceCriteria}`, "", project.brief.acceptanceCriteria, "");
+  return lines.join(`
 `);
 }
 function renderPlanArtifact(project) {
@@ -1679,6 +1831,11 @@ class TeamEngine {
       activeRoleSessions: new Set,
       reportWaiters: new Map,
       planWaiter: null,
+      planWaiterOwner: null,
+      successWaiter: null,
+      nativeBatch: null,
+      stallTimers: new Map,
+      stallNotified: new Set,
       runner: Promise.resolve(),
       roleAgentApplied: new Map
     };
@@ -1689,6 +1846,13 @@ class TeamEngine {
       }
       await this.handleEngineFailure(runtime, error);
     }).finally(() => {
+      for (const timer of runtime.stallTimers.values())
+        clearTimeout(timer);
+      runtime.stallTimers.clear();
+      for (const key of [...this.nativeDoneKeys]) {
+        if (key.startsWith(`${sessionID}:`))
+          this.nativeDoneKeys.delete(key);
+      }
       this.runtimes.delete(sessionID);
       for (const [roleSessionID, owner] of this.roleOwners) {
         if (owner === sessionID)
@@ -1699,16 +1863,99 @@ class TeamEngine {
   }
   onReport(roleSessionID, report) {
     for (const runtime of this.runtimes.values()) {
+      if (runtime.successWaiter && roleSessionID === runtime.sessionID && report.role === "successAuditor") {
+        runtime.successWaiter.resolve(report);
+        return;
+      }
+      if (runtime.nativeBatch && roleSessionID === runtime.sessionID) {
+        const batch = runtime.nativeBatch;
+        if (batch.expected.length === 1 && batch.expected[0].milestoneIndex === -1) {} else {
+          const next = batch.expected.find((entry) => entry.role === report.role && !this.nativeTrackDone(runtime, entry));
+          const target = next ?? batch.expected[batch.received];
+          if (target) {
+            this.markNativeTrackDone(runtime, target);
+            this.handleNativeReport(runtime, target, report);
+            batch.received += 1;
+            if (batch.received >= batch.expected.length) {
+              const resolve = batch.resolve;
+              runtime.nativeBatch = null;
+              resolve();
+            }
+            return;
+          }
+        }
+      }
       const waiter = runtime.reportWaiters.get(roleSessionID);
       if (waiter)
         waiter.resolve(report);
     }
   }
+  nativeDoneKeys = new Set;
+  nativeKey(runtime, entry) {
+    return `${runtime.sessionID}:${entry.milestoneIndex}:${entry.trackID}`;
+  }
+  nativeTrackDone(runtime, entry) {
+    return this.nativeDoneKeys.has(this.nativeKey(runtime, entry));
+  }
+  markNativeTrackDone(runtime, entry) {
+    this.nativeDoneKeys.add(this.nativeKey(runtime, entry));
+  }
+  async handleNativeReport(runtime, target, report) {
+    try {
+      await submitTrackReportByID(runtime.sessionID, target.milestoneIndex, target.trackID, report);
+      this.clearStallTimer(runtime, `native:${target.milestoneIndex}:${target.trackID}`);
+      await this.broadcastTrackReport(runtime, target.milestoneIndex, target.trackID, report);
+    } catch {}
+  }
   onPlan(roleSessionID, plan) {
+    for (const runtime of this.runtimes.values()) {
+      if (runtime.planWaiter && runtime.planWaiterOwner != null && roleSessionID === runtime.planWaiterOwner) {
+        runtime.planWaiter.resolve(plan);
+        return;
+      }
+    }
     const owner = this.roleOwners.get(roleSessionID) ?? roleSessionID;
     const runtime = this.runtimes.get(owner);
     if (runtime?.planWaiter)
       runtime.planWaiter.resolve(plan);
+  }
+  notifyPermissionPending(roleSessionID, detail) {
+    for (const runtime of this.runtimes.values()) {
+      const owned = this.roleOwners.get(roleSessionID);
+      const isMain = roleSessionID === runtime.sessionID;
+      if (owned !== runtime.sessionID && !isMain && !runtime.reportWaiters.has(roleSessionID))
+        continue;
+      (async () => {
+        try {
+          const project = await getProject(runtime.sessionID);
+          if (!project)
+            return;
+          let trackID = roleSessionID;
+          let role = "worker";
+          for (let mi = 0;mi < project.milestones.length; mi += 1) {
+            const milestone = project.milestones[mi];
+            for (const track of milestone.tracks) {
+              if (track.sessionID === roleSessionID) {
+                trackID = track.id;
+                role = track.role;
+              }
+            }
+          }
+          this.clearStallTimer(runtime, roleSessionID);
+          await suspendTimerForPermission(runtime.sessionID).catch(() => null);
+          await setSentinelUpdate(runtime.sessionID, `Permission wait: ${trackID} (${role}) needs approval.`).catch(() => null);
+          await this.ops.promptMain(runtime.sessionID, permissionApprovalPrompt({
+            locale: runtime.locale,
+            projectSlug: project.slug,
+            trackID,
+            role,
+            detail
+          })).catch(() => {
+            return;
+          });
+        } catch {}
+      })();
+    }
   }
   async pause(sessionID) {
     const runtime = this.runtimes.get(sessionID);
@@ -1741,7 +1988,7 @@ class TeamEngine {
         return;
       for (const milestone of project.milestones) {
         for (const track of milestone.tracks) {
-          if (!track.sessionID)
+          if (!track.sessionID || track.sessionID.startsWith("native-"))
             continue;
           const removed = await this.ops.removeSession(track.sessionID).catch(() => false);
           if (!removed) {
@@ -1764,7 +2011,19 @@ class TeamEngine {
     if (runtime.planWaiter) {
       runtime.planWaiter.reject(new AbortedError);
       runtime.planWaiter = null;
+      runtime.planWaiterOwner = null;
     }
+    if (runtime.successWaiter) {
+      runtime.successWaiter.reject(new AbortedError);
+      runtime.successWaiter = null;
+    }
+    if (runtime.nativeBatch) {
+      runtime.nativeBatch.reject(new AbortedError);
+      runtime.nativeBatch = null;
+    }
+    for (const timer of runtime.stallTimers.values())
+      clearTimeout(timer);
+    runtime.stallTimers.clear();
     await Promise.allSettled(interruptions);
   }
   assertActive(runtime, project) {
@@ -1783,6 +2042,95 @@ class TeamEngine {
         projectSlug: project?.slug ?? runtime.sessionID,
         message: `The team stopped unexpectedly: ${detail}. The project is paused; resume it with /teamwork-resume after checking the environment.`
       }));
+    } catch {}
+  }
+  executorOf(project) {
+    const value = project.executor;
+    return value === "isolated" ? "isolated" : "native";
+  }
+  clearStallTimer(runtime, key) {
+    const timer = runtime.stallTimers.get(key);
+    if (timer) {
+      clearTimeout(timer);
+      runtime.stallTimers.delete(key);
+    }
+  }
+  scheduleStallReminder(runtime, key, trackID, role, title, thresholdSeconds) {
+    if (thresholdSeconds == null)
+      return;
+    if (runtime.stallNotified.has(key))
+      return;
+    this.clearStallTimer(runtime, key);
+    const timer = setTimeout(() => {
+      if (runtime.aborted || runtime.stallNotified.has(key))
+        return;
+      runtime.stallNotified.add(key);
+      (async () => {
+        try {
+          const project = await getProject(runtime.sessionID);
+          if (!project)
+            return;
+          await this.ops.promptMain(runtime.sessionID, `[Teamwork stall reminder] ${project.slug} ${trackID} (${role}) has produced no report for ${thresholdSeconds}s: ${title}. The team is still alive; no action needed unless this persists.`).catch(() => {
+            return;
+          });
+        } catch {}
+      })();
+    }, thresholdSeconds * 1000);
+    const maybeUnref = timer.unref;
+    if (typeof maybeUnref === "function")
+      maybeUnref.call(timer);
+    runtime.stallTimers.set(key, timer);
+  }
+  async queueCounts(sessionID) {
+    try {
+      const project = await getProject(sessionID);
+      if (!project)
+        return { running: 0, queued: 0 };
+      let running = 0;
+      let queued = 0;
+      for (const milestone of project.milestones) {
+        for (const track of milestone.tracks) {
+          if (track.status === "running")
+            running += 1;
+          if (track.status === "queued")
+            queued += 1;
+        }
+      }
+      return { running, queued };
+    } catch {
+      return { running: 0, queued: 0 };
+    }
+  }
+  async broadcastTrackReport(runtime, milestoneIndex, trackID, report) {
+    try {
+      const project = await getProject(runtime.sessionID);
+      if (!project)
+        return;
+      const milestone = project.milestones[milestoneIndex];
+      const track = milestone?.tracks.find((candidate) => candidate.id === trackID);
+      await refreshPlanAndProgress(runtime.directory, project).catch(() => {
+        return;
+      });
+      const counts = await this.queueCounts(runtime.sessionID);
+      const summary = trackSummaryPrompt({
+        locale: runtime.locale,
+        projectSlug: project.slug,
+        trackID,
+        role: report.role,
+        title: track?.title ?? trackID,
+        verdict: report.verdict,
+        findings: report.findings,
+        evidence: report.evidence,
+        running: counts.running,
+        queued: counts.queued
+      });
+      await this.ops.promptMain(runtime.sessionID, summary).catch(() => {
+        return;
+      });
+      await this.ops.sendSynthetic(runtime.sessionID, summary).catch(() => {
+        return;
+      });
+      await setSentinelUpdate(runtime.sessionID, `${trackID} (${report.role}) reported ${report.verdict}; running ${counts.running}, queued ${counts.queued}.`).catch(() => null);
     } catch {}
   }
   async runProject(runtime) {
@@ -1815,11 +2163,43 @@ class TeamEngine {
   }
   async runOrchestratorPlan(runtime, project, artifacts) {
     const { sessionID } = runtime;
+    if (this.executorOf(project) === "native") {
+      const syntheticID = `native-${sessionID.slice(0, 8)}-orchestrator`;
+      await recordAdhocSession(sessionID, "orchestrator", syntheticID);
+      const planWaiter = createDeferred();
+      runtime.planWaiter = planWaiter;
+      runtime.planWaiterOwner = sessionID;
+      try {
+        const taskText = roleTaskPrompt({
+          role: "orchestrator",
+          projectSlug: project.slug,
+          workingDirectory: project.workingDirectory ?? runtime.directory,
+          artifactPaths: artifacts,
+          integrityMode: project.brief.integrityMode,
+          taskTitle: "Produce the milestone plan (native: fan out with subagents if it helps)",
+          taskDetail: "Read the request artifact, then break the approved brief into structured milestones. " + "For each milestone: give a short title, a description of the outcome, and the work tracks. " + "Track roles must be one of: explorer, worker, critic, challenger, auditor. " + "The final milestone must make the project's acceptance criteria verifiable end to end. " + "Every milestone must include at least one critic track and one auditor track as its verification " + "gates. Assign each worker track an exclusive file list so tracks never edit the same file. " + "Isolation is prompt-level in native mode; still keep file ownership exclusive. " + "Submit the plan through the teamwork_submit_plan tool.",
+          assignedFiles: [],
+          scratchDirectory: null,
+          attemptContext: null,
+          executorMode: "native"
+        });
+        await this.ops.promptMain(sessionID, taskText);
+        const plan = await planWaiter.promise;
+        const persisted = await setMilestonePlan(sessionID, plan);
+        await refreshPlanAndProgress(runtime.directory, persisted);
+        await this.ops.sendSynthetic(sessionID, `[Teamwork Sentinel] Plan ready for "${persisted.slug}": ${persisted.milestones.length} milestones.`);
+      } finally {
+        runtime.planWaiter = null;
+        runtime.planWaiterOwner = null;
+      }
+      return;
+    }
     const { sessionID: orchestratorSession, agentApplied } = await this.spawnRoleSession(runtime, "orchestrator", project);
     await recordAdhocSession(sessionID, "orchestrator", orchestratorSession);
     runtime.roleAgentApplied.set(orchestratorSession, agentApplied);
     const planWaiter = createDeferred();
     runtime.planWaiter = planWaiter;
+    runtime.planWaiterOwner = orchestratorSession;
     try {
       const taskText = roleTaskPrompt({
         role: "orchestrator",
@@ -1831,7 +2211,8 @@ class TeamEngine {
         taskDetail: "Read the request artifact, then break the approved brief into structured milestones. " + "For each milestone: give a short title, a description of the outcome, and the work tracks. " + "Track roles must be one of: explorer, worker, critic, challenger, auditor. " + "The final milestone must make the project's acceptance criteria verifiable end to end. " + "Every milestone must include at least one critic track and one auditor track as its verification " + "gates. Assign each worker track an exclusive file list so tracks never edit the same file. " + "Submit the plan through the teamwork_submit_plan tool.",
         assignedFiles: [],
         scratchDirectory: null,
-        attemptContext: null
+        attemptContext: null,
+        executorMode: "isolated"
       });
       await this.ops.promptSession(orchestratorSession, withRoleIdentity("orchestrator", agentApplied, taskText));
       const plan = await planWaiter.promise;
@@ -1840,6 +2221,7 @@ class TeamEngine {
       await this.ops.sendSynthetic(sessionID, `[Teamwork Sentinel] Plan ready for "${persisted.slug}": ${persisted.milestones.length} milestones.`);
     } finally {
       runtime.planWaiter = null;
+      runtime.planWaiterOwner = null;
       runtime.activeRoleSessions.delete(orchestratorSession);
     }
   }
@@ -1936,7 +2318,14 @@ class TeamEngine {
     const project = await getProject(runtime.sessionID);
     const milestone = project.milestones[milestoneIndex];
     const workers = milestone.tracks.filter((track) => track.role === "worker" && track.sessionID);
-    for (const track of workers) {
+    if (this.executorOf(project) === "native") {
+      await this.runNativeBatch(runtime, milestoneIndex, workers.map((track) => ({
+        ...track,
+        title: `Fix and complete: ${track.title}`
+      })), "Independent verification rejected the previous attempt for these tracks. Address every finding, re-run the relevant tests and builds, and resubmit one report per track.");
+      return;
+    }
+    await Promise.all(workers.map(async (track) => {
       const feedback = track.lastReport ? [
         `Prior attempt verdict: ${track.lastReport.verdict}.`,
         ...track.lastReport.findings.slice(0, 8).map((finding) => `- ${finding}`),
@@ -1954,15 +2343,22 @@ class TeamEngine {
         taskDetail: "Independent verification rejected the previous attempt for this track. Address every finding, " + "re-run the relevant tests and builds yourself, and resubmit the report.",
         assignedFiles: track.assignedFiles,
         scratchDirectory: null,
-        attemptContext: feedback
+        attemptContext: feedback,
+        executorMode: "isolated"
       }));
-      const report = await this.awaitReport(runtime, track.sessionID);
+      const report = await this.awaitReport(runtime, track.sessionID, track.id, "worker", track.title);
       await submitTrackReport(track.sessionID, report);
-    }
+      await this.broadcastTrackReport(runtime, milestoneIndex, track.id, report);
+    }));
   }
   async runTracksParallel(runtime, milestoneIndex, tracks) {
     const project = await getProject(runtime.sessionID);
-    const limit = Math.max(1, project.maxParallelWorkers);
+    if (this.executorOf(project) === "native") {
+      const milestone = project.milestones[milestoneIndex];
+      await this.runNativeBatch(runtime, milestoneIndex, tracks, milestone.description);
+      return;
+    }
+    const limit = Math.min(8, Math.max(1, project.maxParallelWorkers));
     const queue = [...tracks];
     const workers = [];
     for (let slot = 0;slot < Math.min(limit, queue.length); slot += 1) {
@@ -1978,12 +2374,59 @@ class TeamEngine {
     }
     await Promise.all(workers);
   }
+  async runNativeBatch(runtime, milestoneIndex, tracks, milestoneDescription) {
+    const project = await getProject(runtime.sessionID);
+    const milestone = project.milestones[milestoneIndex];
+    for (const track of tracks) {
+      const syntheticID = `native-${runtime.sessionID.slice(0, 8)}-${track.id}-${Date.now().toString(36)}`;
+      await assignTrackSession(runtime.sessionID, milestoneIndex, track.id, syntheticID);
+    }
+    const refreshed = await getProject(runtime.sessionID);
+    const batchTracks = tracks.map((track) => ({
+      id: track.id,
+      title: track.title,
+      role: track.role,
+      assignedFiles: track.assignedFiles,
+      scratch: track.role === "challenger" ? `${runtime.directory}/.opencode/teamwork/${refreshed.slug}/scratch` : null
+    }));
+    const batchText = nativeBatchPrompt({
+      projectSlug: refreshed.slug,
+      workingDirectory: refreshed.workingDirectory ?? runtime.directory,
+      artifactPaths: refreshed.artifacts,
+      integrityMode: refreshed.brief.integrityMode,
+      milestoneID: milestone.id,
+      milestoneTitle: milestone.title,
+      milestoneDescription,
+      tracks: batchTracks
+    });
+    const deferred = createDeferred();
+    runtime.nativeBatch = {
+      expected: tracks.map((track) => ({ milestoneIndex, trackID: track.id, role: track.role })),
+      received: 0,
+      resolve: () => deferred.resolve(),
+      reject: (error) => deferred.reject(error)
+    };
+    for (const track of tracks) {
+      this.scheduleStallReminder(runtime, `native:${milestoneIndex}:${track.id}`, track.id, track.role, track.title, refreshed.trackStallReminderSeconds);
+    }
+    try {
+      await this.ops.promptMain(runtime.sessionID, batchText);
+      await deferred.promise;
+      this.assertActive(runtime, await getProject(runtime.sessionID));
+    } finally {
+      for (const track of tracks)
+        this.clearStallTimer(runtime, `native:${milestoneIndex}:${track.id}`);
+      if (runtime.nativeBatch)
+        runtime.nativeBatch = null;
+    }
+  }
   async runTrack(runtime, milestoneIndex, track) {
     const project = await getProject(runtime.sessionID);
     const milestone = project.milestones[milestoneIndex];
     const { sessionID: roleSessionID, agentApplied } = await this.spawnRoleSession(runtime, track.role, project);
     await assignTrackSession(runtime.sessionID, milestoneIndex, track.id, roleSessionID);
     runtime.roleAgentApplied.set(roleSessionID, agentApplied);
+    this.scheduleStallReminder(runtime, roleSessionID, track.id, track.role, track.title, project.trackStallReminderSeconds);
     try {
       const taskText = roleTaskPrompt({
         role: track.role,
@@ -1995,20 +2438,53 @@ class TeamEngine {
         taskDetail: milestone.description,
         assignedFiles: track.assignedFiles,
         scratchDirectory: track.role === "challenger" ? `${runtime.directory}/.opencode/teamwork/${project.slug}/scratch` : null,
-        attemptContext: null
+        attemptContext: null,
+        executorMode: "isolated"
       });
       await this.ops.promptSession(roleSessionID, withRoleIdentity(track.role, agentApplied, taskText));
-      const report = await this.awaitReport(runtime, roleSessionID);
+      const report = await this.awaitReport(runtime, roleSessionID, track.id, track.role, track.title);
       await submitTrackReport(roleSessionID, report);
+      await this.broadcastTrackReport(runtime, milestoneIndex, track.id, report);
     } finally {
+      this.clearStallTimer(runtime, roleSessionID);
       runtime.activeRoleSessions.delete(roleSessionID);
       runtime.reportWaiters.delete(roleSessionID);
     }
   }
   async runSuccessAudit(runtime) {
     const project = await getProject(runtime.sessionID);
+    if (this.executorOf(project) === "native") {
+      const syntheticID = `native-${runtime.sessionID.slice(0, 8)}-successAuditor`;
+      await recordAdhocSession(runtime.sessionID, "successAuditor", syntheticID);
+      const waiter = createDeferred();
+      runtime.successWaiter = waiter;
+      this.scheduleStallReminder(runtime, syntheticID, "success-audit", "successAuditor", "End-to-end success audit", project.trackStallReminderSeconds);
+      try {
+        const taskText = roleTaskPrompt({
+          role: "successAuditor",
+          projectSlug: project.slug,
+          workingDirectory: project.workingDirectory ?? runtime.directory,
+          artifactPaths: project.artifacts,
+          integrityMode: project.brief.integrityMode,
+          taskTitle: "End-to-end success audit (native: fan out verification with subagents)",
+          taskDetail: "All milestones passed their gates. Run a full end-to-end verification pass against the request " + "artifact's acceptance criteria: build, test, and run the project for real. Every criterion must be " + "verified with verbatim command output. Isolation is prompt-level; still rerun every claimed command yourself. " + "Submit the result through the teamwork_report tool with role successAuditor.",
+          assignedFiles: [],
+          scratchDirectory: null,
+          attemptContext: null,
+          executorMode: "native"
+        });
+        await this.ops.promptMain(runtime.sessionID, taskText);
+        const report = await waiter.promise;
+        await this.finishSuccessAuditWithReport(runtime, project, report);
+      } finally {
+        this.clearStallTimer(runtime, syntheticID);
+        runtime.successWaiter = null;
+      }
+      return;
+    }
     const { sessionID: successSession, agentApplied } = await this.spawnRoleSession(runtime, "successAuditor", project);
     await recordAdhocSession(runtime.sessionID, "successAuditor", successSession);
+    this.scheduleStallReminder(runtime, successSession, "success-audit", "successAuditor", "End-to-end success audit", project.trackStallReminderSeconds);
     try {
       const taskText = roleTaskPrompt({
         role: "successAuditor",
@@ -2020,31 +2496,36 @@ class TeamEngine {
         taskDetail: "All milestones passed their gates. Run a full end-to-end verification pass against the request " + "artifact's acceptance criteria: build, test, and run the project for real. Every criterion must be " + "verified with command output.",
         assignedFiles: [],
         scratchDirectory: null,
-        attemptContext: null
+        attemptContext: null,
+        executorMode: "isolated"
       });
       await this.ops.promptSession(successSession, withRoleIdentity("successAuditor", agentApplied, taskText));
-      const report = await this.awaitReport(runtime, successSession);
-      if (report.verdict !== "pass") {
-        const blockers = report.blockers.length > 0 ? report.blockers : report.findings;
-        await pauseProject(runtime.sessionID, `The Success Auditor rejected the project: ${blockers.slice(0, 3).join("; ")}`, { stopReason: "success audit failed", blocker: blockers.join("; "), historyType: "verification" });
-        await this.ops.promptMain(runtime.sessionID, sentinelDecisionPrompt({
-          locale: runtime.locale,
-          projectSlug: project.slug,
-          message: "The Success Auditor rejected the completed project. The project is paused for review.",
-          details: blockers.slice(0, 6)
-        }));
-        throw new AbortedError;
-      }
-      const evidence = [...report.evidence.slice(0, 10), ...report.findings.slice(0, 10)].join("; ");
-      await completeProject(runtime.sessionID, evidence || "The Success Auditor passed the end-to-end verification.");
-      await this.cleanupRoleSessions(runtime);
-      await setSentinelUpdate(runtime.sessionID, `Project "${project.slug}" completed and verified end to end.`);
-      await refreshPlanAndProgress(runtime.directory, await getProject(runtime.sessionID));
-      await this.ops.sendSynthetic(runtime.sessionID, `[Teamwork Sentinel] Project "${project.slug}" is complete: all milestones passed and the Success Auditor verified it end to end.`);
+      const report = await this.awaitReport(runtime, successSession, "success-audit", "successAuditor", "audit");
+      await this.finishSuccessAuditWithReport(runtime, project, report);
     } finally {
+      this.clearStallTimer(runtime, successSession);
       runtime.activeRoleSessions.delete(successSession);
       runtime.reportWaiters.delete(successSession);
     }
+  }
+  async finishSuccessAuditWithReport(runtime, project, report) {
+    if (report.verdict !== "pass") {
+      const blockers = report.blockers.length > 0 ? report.blockers : report.findings;
+      await pauseProject(runtime.sessionID, `The Success Auditor rejected the project: ${blockers.slice(0, 3).join("; ")}`, { stopReason: "success audit failed", blocker: blockers.join("; "), historyType: "verification" });
+      await this.ops.promptMain(runtime.sessionID, sentinelDecisionPrompt({
+        locale: runtime.locale,
+        projectSlug: project.slug,
+        message: "The Success Auditor rejected the completed project. The project is paused for review.",
+        details: blockers.slice(0, 6)
+      }));
+      throw new AbortedError;
+    }
+    const evidence = [...report.evidence.slice(0, 10), ...report.findings.slice(0, 10)].join("; ");
+    await completeProject(runtime.sessionID, evidence || "The Success Auditor passed the end-to-end verification.");
+    await this.cleanupRoleSessions(runtime);
+    await setSentinelUpdate(runtime.sessionID, `Project "${project.slug}" completed and verified end to end.`);
+    await refreshPlanAndProgress(runtime.directory, await getProject(runtime.sessionID));
+    await this.ops.sendSynthetic(runtime.sessionID, `[Teamwork Sentinel] Project "${project.slug}" is complete: all milestones passed and the Success Auditor verified it end to end.`);
   }
   async spawnRoleSession(runtime, role, project) {
     const result = await this.ops.createSession({
@@ -2058,17 +2539,19 @@ class TeamEngine {
   async roleSessionIDsFor(runtime) {
     const sessionIDs = new Set;
     for (const [roleSessionID, owner] of this.roleOwners) {
-      if (owner === runtime.sessionID)
+      if (owner === runtime.sessionID && !roleSessionID.startsWith("native-"))
         sessionIDs.add(roleSessionID);
     }
-    for (const sessionID of runtime.activeRoleSessions)
-      sessionIDs.add(sessionID);
+    for (const sessionID of runtime.activeRoleSessions) {
+      if (!sessionID.startsWith("native-"))
+        sessionIDs.add(sessionID);
+    }
     try {
       const project = await getProject(runtime.sessionID);
       if (project) {
         for (const milestone of project.milestones) {
           for (const track of milestone.tracks) {
-            if (track.sessionID)
+            if (track.sessionID && !track.sessionID.startsWith("native-"))
               sessionIDs.add(track.sessionID);
           }
         }
@@ -2097,7 +2580,7 @@ class TeamEngine {
       runtime.activeRoleSessions.delete(roleSessionID);
     }
   }
-  async awaitReport(runtime, roleSessionID) {
+  async awaitReport(runtime, roleSessionID, _trackID, _role, _title) {
     const waiter = createDeferred();
     runtime.reportWaiters.set(roleSessionID, waiter);
     const sessionEnded = this.ops.waitForSession(roleSessionID).then(() => {
@@ -2150,7 +2633,10 @@ var EN_MESSAGES = {
     artifactsWritten: "Paths of files this role created or modified, if any.",
     tokenBudget: "Optional positive token budget for the whole team (all role sessions combined).",
     maxAutoTurns: "Optional cap on the number of role sessions the team may spawn.",
-    maxDurationSeconds: "Optional wall-clock limit for the whole project."
+    maxDurationSeconds: "Optional wall-clock limit for the whole project.",
+    executor: "Executor: native (main-session subagents, fast, prompt-level isolation) or isolated (separate sessions, strong isolation). Default native.",
+    maxParallelWorkers: "Max parallel tracks within a phase (default 5, cap 8).",
+    trackStallReminderSeconds: "Per-track soft stall reminder in seconds (default 1800); null disables. Reminder only, never fails the track."
   },
   notices: {
     planModeCreate: "Project recorded while the session is in Plan mode, so execution is paused. Do not start implementation " + "work now. Ask the user to switch to Build mode and resume the project (for example with " + '"/teamwork resume") to begin execution.',
@@ -2236,7 +2722,10 @@ var ZH_TW_MESSAGES = {
     artifactsWritten: "\u8A72\u89D2\u8272\u5EFA\u7ACB\u6216\u4FEE\u6539\u7684\u6A94\u6848\u8DEF\u5F91\uFF08\u82E5\u6709\u7684\u8A71\uFF09\u3002",
     tokenBudget: "\u6574\u500B\u5718\u968A\uFF08\u6240\u6709\u89D2\u8272 session \u5408\u8A08\uFF09\u7684\u9078\u586B token \u9810\u7B97\u3002",
     maxAutoTurns: "\u5718\u968A\u53EF\u5EFA\u7ACB\u7684\u89D2\u8272 session \u6578\u91CF\u4E0A\u9650\uFF08\u9078\u586B\uFF09\u3002",
-    maxDurationSeconds: "\u6574\u500B\u5C08\u6848\u7684\u6642\u9593\u4E0A\u9650\uFF08\u9078\u586B\uFF09\u3002"
+    maxDurationSeconds: "\u6574\u500B\u5C08\u6848\u7684\u6642\u9593\u4E0A\u9650\uFF08\u9078\u586B\uFF09\u3002",
+    executor: "\u57F7\u884C\u5668\uFF1Anative\uFF08\u4E3B session \u539F\u751F subagent\uFF0C\u5FEB\uFF0Cprompt \u7D1A\u9694\u96E2\uFF09\u6216 isolated\uFF08\u7368\u7ACB session\uFF0C\u5F37\u9694\u96E2\uFF09\u3002\u9810\u8A2D native\u3002",
+    maxParallelWorkers: "\u540C phase \u6700\u5927\u4E26\u884C track \u6578\uFF08\u9810\u8A2D 5\uFF0C\u4E0A\u9650 8\uFF09\u3002",
+    trackStallReminderSeconds: "\u55AE track \u8EDF\u63D0\u9192\u95BE\u503C\u79D2\u6578\uFF08\u9810\u8A2D 1800\uFF09\uFF1Bnull \u505C\u7528\u3002\u53EA\u63D0\u9192\u3001\u4E0D\u5224 fail\u3002"
   },
   notices: {
     planModeCreate: "\u5C08\u6848\u5DF2\u5728 Plan \u6A21\u5F0F\u4E0B\u8A18\u9304\uFF0C\u56E0\u6B64\u57F7\u884C\u88AB\u66AB\u505C\u3002\u73FE\u5728\u4E0D\u8981\u958B\u59CB\u5BE6\u4F5C\u5DE5\u4F5C\u3002\u8ACB\u8B93\u4F7F\u7528\u8005\u5207\u63DB\u5230 Build \u6A21\u5F0F\u4E26\u6062\u5FA9\u5C08\u6848" + "\uFF08\u4F8B\u5982\u4F7F\u7528\u300C/teamwork resume\u300D\uFF09\u5F8C\u518D\u958B\u59CB\u57F7\u884C\u3002",
@@ -2322,7 +2811,10 @@ var ZH_CN_MESSAGES = {
     artifactsWritten: "\u8BE5\u89D2\u8272\u521B\u5EFA\u6216\u4FEE\u6539\u7684\u6587\u4EF6\u8DEF\u5F84\uFF08\u5982\u679C\u6709\u7684\u8BDD\uFF09\u3002",
     tokenBudget: "\u6574\u4E2A\u56E2\u961F\uFF08\u6240\u6709\u89D2\u8272 session \u5408\u8BA1\uFF09\u7684\u9009\u586B token \u9884\u7B97\u3002",
     maxAutoTurns: "\u56E2\u961F\u53EF\u521B\u5EFA\u7684\u89D2\u8272 session \u6570\u91CF\u4E0A\u9650\uFF08\u9009\u586B\uFF09\u3002",
-    maxDurationSeconds: "\u6574\u4E2A\u9879\u76EE\u7684\u65F6\u95F4\u4E0A\u9650\uFF08\u9009\u586B\uFF09\u3002"
+    maxDurationSeconds: "\u6574\u4E2A\u9879\u76EE\u7684\u65F6\u95F4\u4E0A\u9650\uFF08\u9009\u586B\uFF09\u3002",
+    executor: "\u6267\u884C\u5668\uFF1Anative\uFF08\u4E3B session \u539F\u751F subagent\uFF0C\u5FEB\uFF0Cprompt \u7EA7\u9694\u79BB\uFF09\u6216 isolated\uFF08\u72EC\u7ACB session\uFF0C\u5F3A\u9694\u79BB\uFF09\u3002\u9ED8\u8BA4 native\u3002",
+    maxParallelWorkers: "\u540C phase \u6700\u5927\u5E76\u884C track \u6570\uFF08\u9ED8\u8BA4 5\uFF0C\u4E0A\u9650 8\uFF09\u3002",
+    trackStallReminderSeconds: "\u5355 track \u8F6F\u63D0\u9192\u9608\u503C\u79D2\u6570\uFF08\u9ED8\u8BA4 1800\uFF09\uFF1Bnull \u505C\u7528\u3002\u53EA\u63D0\u9192\u3001\u4E0D\u5224 fail\u3002"
   },
   notices: {
     planModeCreate: "\u9879\u76EE\u5DF2\u5728 Plan \u6A21\u5F0F\u4E0B\u8BB0\u5F55\uFF0C\u56E0\u6B64\u6267\u884C\u88AB\u6682\u505C\u3002\u73B0\u5728\u4E0D\u8981\u5F00\u59CB\u5B9E\u73B0\u5DE5\u4F5C\u3002\u8BF7\u8BA9\u7528\u6237\u5207\u6362\u5230 Build \u6A21\u5F0F\u5E76\u6062\u590D\u9879\u76EE" + "\uFF08\u4F8B\u5982\u4F7F\u7528\u300C/teamwork resume\u300D\uFF09\u540E\u518D\u5F00\u59CB\u6267\u884C\u3002",
@@ -2447,6 +2939,25 @@ function restrictedAgentSet(options) {
   const names = Array.isArray(options?.restricted_agents) ? options.restricted_agents : DEFAULT_RESTRICTED_AGENTS;
   return new Set(names.map((name) => typeof name === "string" ? name.trim().toLowerCase() : "").filter(Boolean));
 }
+function normalizeExecutorOption(value) {
+  return value === "native" || value === "isolated" ? value : null;
+}
+function defaultExecutorFromOptions(options) {
+  return normalizeExecutorOption(options?.executor) ?? normalizeExecutorOption(options?.default_executor) ?? "native";
+}
+function clampParallelWorkersOption(value) {
+  if (typeof value !== "number" || !Number.isSafeInteger(value))
+    return null;
+  return Math.min(8, Math.max(1, value));
+}
+function stallReminderFromOptions(options) {
+  if (!options || !("track_stall_reminder_seconds" in options))
+    return;
+  const value = options.track_stall_reminder_seconds;
+  if (value === null)
+    return null;
+  return positiveIntegerOrNull2(value) ?? undefined;
+}
 var ROLE_AGENT_DEFINITIONS = ROLE_AGENT_NAMES.map((role) => ({
   role,
   permission: {
@@ -2534,6 +3045,10 @@ var LOCALE_ENUM = {
   type: "string",
   enum: ["en", "zh-TW", "zh-CN"]
 };
+var EXECUTOR_ENUM = {
+  type: "string",
+  enum: ["native", "isolated"]
+};
 var BRIEF_PROPERTIES = (messages) => ({
   name: TEXT_SCHEMA(messages.tools.projectName),
   objectives: TEXT_SCHEMA(messages.tools.brief),
@@ -2572,6 +3087,47 @@ function decodeV2Event(value) {
   if (typeof decoded.created !== "number")
     return;
   return decoded;
+}
+function isPermissionPendingEvent(event) {
+  const type = event.type.toLowerCase();
+  if (type.includes("permission") || type.includes("approval") || type.includes("auth.ask") || type.includes("ask.permission")) {
+    return true;
+  }
+  const data = event.data;
+  for (const key of ["permission", "approval", "permissionRequest", "authRequest"]) {
+    if (data[key] != null)
+      return true;
+  }
+  const status = typeof data.status === "string" ? data.status.toLowerCase() : "";
+  if (status.includes("permission") || status.includes("approval") || status.includes("waiting")) {
+    const blob = JSON.stringify(data).toLowerCase();
+    if (blob.includes("permission") || blob.includes("approval"))
+      return true;
+  }
+  return false;
+}
+function permissionDetailFromEvent(event) {
+  const data = event.data;
+  const candidates = [
+    data.detail,
+    data.message,
+    data.permission,
+    data.permissionRequest,
+    data.approval,
+    data.authRequest,
+    data.tool,
+    data.action
+  ];
+  for (const candidate of candidates) {
+    if (typeof candidate === "string" && candidate.trim())
+      return candidate.trim().slice(0, 500);
+    if (isRecord(candidate)) {
+      try {
+        return JSON.stringify(candidate).slice(0, 500);
+      } catch {}
+    }
+  }
+  return `Host event "${event.type}" indicates a permission approval is waiting. Approve or deny it in the host UI.`;
 }
 function logError(message, error) {
   try {
@@ -2724,6 +3280,16 @@ async function setupV2(context) {
     const sessionID = typeof data.sessionID === "string" ? data.sessionID : undefined;
     if (!sessionID || disposed)
       return;
+    if (isPermissionPendingEvent(event)) {
+      try {
+        const detail = permissionDetailFromEvent(event);
+        await suspendTimerForPermission(engine.projectSessionFor(sessionID) ?? sessionID).catch(() => null);
+        engine.notifyPermissionPending(sessionID, detail);
+      } catch (error) {
+        logError("Failed to handle permission pending event", error);
+      }
+      return;
+    }
     switch (event.type) {
       case "session.agent.selected": {
         if (typeof data.agent === "string") {
@@ -2914,11 +3480,19 @@ function teamworkToolsV2(services) {
         ...BRIEF_PROPERTIES(messages),
         token_budget: { type: ["integer", "null"], minimum: 1, description: messages.tools.tokenBudget },
         max_auto_turns: { type: ["integer", "null"], minimum: 1, description: messages.tools.maxAutoTurns },
-        max_duration_seconds: { type: ["integer", "null"], minimum: 1, description: messages.tools.maxDurationSeconds }
+        max_duration_seconds: { type: ["integer", "null"], minimum: 1, description: messages.tools.maxDurationSeconds },
+        executor: { ...EXECUTOR_ENUM, description: messages.tools.executor },
+        max_parallel_workers: { type: ["integer", "null"], minimum: 1, maximum: 8, description: messages.tools.maxParallelWorkers },
+        track_stall_reminder_seconds: {
+          type: ["integer", "null"],
+          minimum: 1,
+          description: messages.tools.trackStallReminderSeconds
+        }
       }, ["name", "objectives", "requirements", "verification", "acceptance_criteria"]),
       options: { codemode: false },
       execute: async (rawArgs, toolContext) => {
         const args = rawArgs;
+        const stallFromArgs = "track_stall_reminder_seconds" in args ? args.track_stall_reminder_seconds === null ? null : positiveIntegerOrNull2(args.track_stall_reminder_seconds) ?? undefined : stallReminderFromOptions(options);
         const project = await createProject(toolContext.sessionID, {
           name: args.name,
           objectives: args.objectives,
@@ -2931,8 +3505,10 @@ function teamworkToolsV2(services) {
           tokenBudget: positiveIntegerOrNull2(args.token_budget) ?? positiveIntegerOrNull2(options.default_token_budget),
           maxAutoTurns: positiveIntegerOrNull2(args.max_auto_turns) ?? positiveIntegerOrNull2(options.max_auto_turns),
           maxDurationSeconds: positiveIntegerOrNull2(args.max_duration_seconds) ?? positiveIntegerOrNull2(options.max_duration_seconds),
-          maxParallelWorkers: positiveIntegerOrNull2(options.max_parallel_workers),
+          maxParallelWorkers: clampParallelWorkersOption(args.max_parallel_workers) ?? clampParallelWorkersOption(options.max_parallel_workers),
           maxVerificationRetries: nonNegativeIntegerOrNull2(options.max_verification_retries),
+          executor: normalizeExecutorOption(args.executor) ?? defaultExecutorFromOptions(options),
+          trackStallReminderSeconds: stallFromArgs,
           workingDirectory: directory
         });
         const artifacts = await writeArtifacts(directory, project);
@@ -2951,14 +3527,11 @@ function teamworkToolsV2(services) {
     },
     {
       name: "teamwork_revise",
-      description: "Commit a revised brief for the project that is awaiting approval. Call after the user requests changes " + "through /teamwork-revise, passing the complete updated brief.",
-      input: v2ObjectSchema(BRIEF_PROPERTIES(messages), [
-        "name",
-        "objectives",
-        "requirements",
-        "verification",
-        "acceptance_criteria"
-      ]),
+      description: "Commit a revised brief for the project that is awaiting approval (or switch the executor while paused). Call after the user requests changes " + "through /teamwork-revise, passing the complete updated brief.",
+      input: v2ObjectSchema({
+        ...BRIEF_PROPERTIES(messages),
+        executor: { ...EXECUTOR_ENUM, description: messages.tools.executor }
+      }, ["name", "objectives", "requirements", "verification", "acceptance_criteria"]),
       options: { codemode: false },
       execute: async (rawArgs, toolContext) => {
         const args = rawArgs;
@@ -2970,7 +3543,7 @@ function teamworkToolsV2(services) {
           acceptanceCriteria: args.acceptance_criteria,
           integrityMode: args.integrity_mode ?? "development",
           artifactLocale: isTeamworkLocale(args.artifact_locale) ? args.artifact_locale : "en"
-        });
+        }, { executor: normalizeExecutorOption(args.executor) });
         const artifacts = await writeArtifacts(directory, project);
         await setProjectArtifacts(toolContext.sessionID, artifacts);
         return {

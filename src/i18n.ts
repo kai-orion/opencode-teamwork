@@ -41,6 +41,9 @@ export type TeamworkMessages = {
     tokenBudget: string
     maxAutoTurns: string
     maxDurationSeconds: string
+    executor: string
+    maxParallelWorkers: string
+    trackStallReminderSeconds: string
   }
   notices: {
     planModeCreate: string
@@ -136,6 +139,9 @@ const EN_MESSAGES: TeamworkMessages = {
     tokenBudget: "Optional positive token budget for the whole team (all role sessions combined).",
     maxAutoTurns: "Optional cap on the number of role sessions the team may spawn.",
     maxDurationSeconds: "Optional wall-clock limit for the whole project.",
+    executor: "Executor: native (main-session subagents, fast, prompt-level isolation) or isolated (separate sessions, strong isolation). Default native.",
+    maxParallelWorkers: "Max parallel tracks within a phase (default 5, cap 8).",
+    trackStallReminderSeconds: "Per-track soft stall reminder in seconds (default 1800); null disables. Reminder only, never fails the track.",
   },
   notices: {
     planModeCreate:
@@ -238,6 +244,9 @@ const ZH_TW_MESSAGES: TeamworkMessages = {
     tokenBudget: "整個團隊（所有角色 session 合計）的選填 token 預算。",
     maxAutoTurns: "團隊可建立的角色 session 數量上限（選填）。",
     maxDurationSeconds: "整個專案的時間上限（選填）。",
+    executor: "執行器：native（主 session 原生 subagent，快，prompt 級隔離）或 isolated（獨立 session，強隔離）。預設 native。",
+    maxParallelWorkers: "同 phase 最大並行 track 數（預設 5，上限 8）。",
+    trackStallReminderSeconds: "單 track 軟提醒閾值秒數（預設 1800）；null 停用。只提醒、不判 fail。",
   },
   notices: {
     planModeCreate:
@@ -336,6 +345,9 @@ const ZH_CN_MESSAGES: TeamworkMessages = {
     tokenBudget: "整个团队（所有角色 session 合计）的选填 token 预算。",
     maxAutoTurns: "团队可创建的角色 session 数量上限（选填）。",
     maxDurationSeconds: "整个项目的时间上限（选填）。",
+    executor: "执行器：native（主 session 原生 subagent，快，prompt 级隔离）或 isolated（独立 session，强隔离）。默认 native。",
+    maxParallelWorkers: "同 phase 最大并行 track 数（默认 5，上限 8）。",
+    trackStallReminderSeconds: "单 track 软提醒阈值秒数（默认 1800）；null 停用。只提醒、不判 fail。",
   },
   notices: {
     planModeCreate:

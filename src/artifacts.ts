@@ -93,20 +93,45 @@ function labels(locale: TeamworkLocale) {
   return LABELS[locale] ?? LABELS.en
 }
 
+const EXECUTOR_LABEL: Record<TeamworkLocale, string> = {
+  en: "Executor",
+  "zh-TW": "執行器",
+  "zh-CN": "执行器",
+}
+
+const PARALLEL_LABEL: Record<TeamworkLocale, string> = {
+  en: "Max parallel workers",
+  "zh-TW": "最大並行數",
+  "zh-CN": "最大并行数",
+}
+
+const NATIVE_NOTE: Record<TeamworkLocale, string> = {
+  en: "Native mode: prompt-level isolation only. Evidence must be verbatim command output; the Auditor reruns commands. Gates stay strict.",
+  "zh-TW": "Native 模式：僅 prompt 級隔離。Evidence 必須是原始命令輸出貼上；Auditor 會重跑命令。門禁強度不變。",
+  "zh-CN": "Native 模式：仅 prompt 级隔离。Evidence 必须是原始命令输出粘贴；Auditor 会重跑命令。门禁强度不变。",
+}
+
 function iso(timestamp: number) {
   return new Date(timestamp * 1000).toISOString()
 }
 
 export function renderRequestArtifact(project: Project) {
   const label = labels(project.brief.artifactLocale)
-  return [
+  const executor = (project as { executor?: string }).executor ?? "native"
+  const parallel = (project as { maxParallelWorkers?: number }).maxParallelWorkers ?? 5
+  const lines = [
     `# ${label.title}: ${project.slug}`,
     "",
     `- ${label.project}: ${project.slug}`,
     `- ${label.workingDirectory}: ${project.workingDirectory ?? "n/a"}`,
     `- ${label.integrityMode}: ${project.brief.integrityMode}`,
+    `- ${EXECUTOR_LABEL[project.brief.artifactLocale]}: ${executor}`,
+    `- ${PARALLEL_LABEL[project.brief.artifactLocale]}: ${parallel}`,
     `- ${label.status}: ${project.phase}`,
     "",
+  ]
+  if (executor === "native") lines.push(`${NATIVE_NOTE[project.brief.artifactLocale]}`, "")
+  lines.push(
     `## ${label.objectives}`,
     "",
     project.brief.objectives,
@@ -123,7 +148,8 @@ export function renderRequestArtifact(project: Project) {
     "",
     project.brief.acceptanceCriteria,
     "",
-  ].join("\n")
+  )
+  return lines.join("\n")
 }
 
 export function renderPlanArtifact(project: Project) {
