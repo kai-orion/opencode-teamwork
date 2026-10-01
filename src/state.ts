@@ -5,9 +5,21 @@ import { homedir } from "node:os"
 import { dirname, join } from "node:path"
 import { Data, Effect, Schema } from "effect"
 import { atomicWriteFile } from "./atomic-write"
-import type { IntegrityMode, Phase, TeamworkLocale } from "./i18n"
 
-export type { IntegrityMode, Phase }
+export type Phase =
+  | "interview"
+  | "awaitingApproval"
+  | "executing"
+  | "paused"
+  | "budgetLimited"
+  | "complete"
+  | "cancelled"
+
+export type IntegrityMode = "development" | "demo" | "benchmark"
+
+export type ExecutionPath = "general" | "iterative" | "review" | "math" | "math-large"
+
+export type TeamScale = "S" | "M" | "L"
 
 export type TeamRole =
   | "orchestrator"
@@ -17,8 +29,11 @@ export type TeamRole =
   | "challenger"
   | "auditor"
   | "successAuditor"
-
-export type ExecutorMode = "native" | "isolated"
+  | "prover"
+  | "falsifier"
+  | "verifier"
+  | "reviewer"
+  | "synthesizer"
 
 export type MilestoneStatus = "pending" | "inProgress" | "verification" | "passed" | "failed"
 export type TrackStatus = "queued" | "running" | "awaitingVerification" | "passed" | "failed"
@@ -52,7 +67,9 @@ export type Brief = {
   verification: string
   acceptanceCriteria: string
   integrityMode: IntegrityMode
-  artifactLocale: TeamworkLocale
+  executionPath: ExecutionPath
+  teamScale: TeamScale | null
+  deep: boolean
 }
 
 export type RoleReport = {
@@ -96,9 +113,7 @@ export type CreateProjectOptions = {
   maxAutoTurns?: number | null
   maxDurationSeconds?: number | null
   maxParallelWorkers?: number | null
-  maxVerificationRetries?: number | null
   workingDirectory?: string | null
-  executor?: ExecutorMode | string | null
   trackStallReminderSeconds?: number | null
 }
 
@@ -117,7 +132,7 @@ export type Project = {
   phase: Phase
   milestones: Milestone[]
   activeMilestoneIndex: number
-  artifacts: { request: string; plan: string; progress: string } | null
+  artifacts: { brief: string; request: string; plan: string; progress: string } | null
   workingDirectory: string | null
   tokenBudget: number | null
   tokensUsed: number
@@ -129,8 +144,6 @@ export type Project = {
   maxAutoTurns: number | null
   maxDurationSeconds: number | null
   maxParallelWorkers: number
-  maxVerificationRetries: number
-  executor: ExecutorMode
   /** Soft per-track stall reminder threshold in seconds; null disables. */
   trackStallReminderSeconds: number | null
   planPaused: boolean
@@ -146,7 +159,7 @@ export type Project = {
 }
 
 type State = {
-  version: 1
+  version: 2
   projects: Record<string, Project>
 }
 
@@ -166,18 +179,26 @@ const MAX_HISTORY_ENTRIES = 80
 const CHECKPOINT_CHAR_LIMIT = 280
 const DEFAULT_MAX_PARALLEL_WORKERS = 5
 const MAX_PARALLEL_WORKERS_CAP = 8
-const DEFAULT_MAX_VERIFICATION_RETRIES = 2
-const DEFAULT_EXECUTOR: ExecutorMode = "native"
 const DEFAULT_TRACK_STALL_REMINDER_SECONDS = 1800
 const NULLABLE_STRING = Schema.NullOr(Schema.String)
 const NULLABLE_NUMBER = Schema.NullOr(Schema.Number)
 
-export function isExecutorMode(value: unknown): value is ExecutorMode {
-  return value === "native" || value === "isolated"
+export const EXECUTION_PATHS: ExecutionPath[] = ["general", "iterative", "review", "math", "math-large"]
+
+export function isExecutionPath(value: unknown): value is ExecutionPath {
+  return typeof value === "string" && (EXECUTION_PATHS as string[]).includes(value)
 }
 
-export function normalizeExecutorMode(value: unknown): ExecutorMode {
-  return isExecutorMode(value) ? value : DEFAULT_EXECUTOR
+export function normalizeExecutionPath(value: unknown): ExecutionPath {
+  return isExecutionPath(value) ? value : "general"
+}
+
+export function normalizeTeamScale(value: unknown): TeamScale | null {
+  return value === "S" || value === "M" || value === "L" ? value : null
+}
+
+export function normalizeDeepFlag(value: unknown): boolean {
+  return value === undefined ? true : value !== false && value !== "off" && value !== 0
 }
 
 export function clampParallelWorkers(value: unknown): number {
@@ -185,7 +206,7 @@ export function clampParallelWorkers(value: unknown): number {
   return Math.min(MAX_PARALLEL_WORKERS_CAP, Math.max(1, parsed))
 }
 
-export { DEFAULT_EXECUTOR, DEFAULT_MAX_PARALLEL_WORKERS, MAX_PARALLEL_WORKERS_CAP, DEFAULT_TRACK_STALL_REMINDER_SECONDS }
+export { DEFAULT_MAX_PARALLEL_WORKERS, MAX_PARALLEL_WORKERS_CAP, DEFAULT_TRACK_STALL_REMINDER_SECONDS }
 
 const HistoryEntrySchema = Schema.Struct({
   type: Schema.Literal(
@@ -214,19 +235,28 @@ const BriefSchema = Schema.Struct({
   verification: Schema.String,
   acceptanceCriteria: Schema.String,
   integrityMode: Schema.Literal("development", "demo", "benchmark"),
-  artifactLocale: Schema.Literal("en", "zh-TW", "zh-CN"),
+  executionPath: Schema.Literal("general", "iterative", "review", "math", "math-large"),
+  teamScale: Schema.NullOr(Schema.Literal("S", "M", "L")),
+  deep: Schema.Boolean,
 })
 
+const TEAM_ROLES = [
+  "orchestrator",
+  "explorer",
+  "worker",
+  "critic",
+  "challenger",
+  "auditor",
+  "successAuditor",
+  "prover",
+  "falsifier",
+  "verifier",
+  "reviewer",
+  "synthesizer",
+] as const
+
 const RoleReportSchema = Schema.Struct({
-  role: Schema.Literal(
-    "orchestrator",
-    "explorer",
-    "worker",
-    "critic",
-    "challenger",
-    "auditor",
-    "successAuditor",
-  ),
+  role: Schema.Literal(...TEAM_ROLES),
   verdict: Schema.Literal("pass", "fail", "blocked"),
   findings: Schema.optionalWith(Schema.Array(Schema.String), { default: () => [] }),
   evidence: Schema.optionalWith(Schema.Array(Schema.String), { default: () => [] }),
@@ -238,15 +268,7 @@ const RoleReportSchema = Schema.Struct({
 const TrackSchema = Schema.Struct({
   id: Schema.String,
   title: Schema.String,
-  role: Schema.Literal(
-    "orchestrator",
-    "explorer",
-    "worker",
-    "critic",
-    "challenger",
-    "auditor",
-    "successAuditor",
-  ),
+  role: Schema.Literal(...TEAM_ROLES),
   assignedFiles: Schema.optionalWith(Schema.Array(Schema.String), { default: () => [] }),
   status: Schema.Literal("queued", "running", "awaitingVerification", "passed", "failed"),
   sessionID: Schema.optionalWith(NULLABLE_STRING, { default: () => null }),
@@ -277,6 +299,7 @@ const UsageTrackerSchema = Schema.Struct({
 })
 
 const ArtifactsSchema = Schema.Struct({
+  brief: Schema.String,
   request: Schema.String,
   plan: Schema.String,
   progress: Schema.String,
@@ -311,8 +334,6 @@ const ProjectSchema = Schema.Struct({
   maxAutoTurns: Schema.optionalWith(NULLABLE_NUMBER, { default: () => null }),
   maxDurationSeconds: Schema.optionalWith(NULLABLE_NUMBER, { default: () => null }),
   maxParallelWorkers: Schema.optionalWith(Schema.Number, { default: () => DEFAULT_MAX_PARALLEL_WORKERS }),
-  maxVerificationRetries: Schema.optionalWith(Schema.Number, { default: () => DEFAULT_MAX_VERIFICATION_RETRIES }),
-  executor: Schema.optionalWith(Schema.Literal("native", "isolated"), { default: () => DEFAULT_EXECUTOR }),
   trackStallReminderSeconds: Schema.optionalWith(NULLABLE_NUMBER, {
     default: () => DEFAULT_TRACK_STALL_REMINDER_SECONDS,
   }),
@@ -329,7 +350,7 @@ const ProjectSchema = Schema.Struct({
 })
 
 const StateSchema = Schema.Struct({
-  version: Schema.Literal(1),
+  version: Schema.Literal(2),
   projects: Schema.Record({ key: Schema.String, value: ProjectSchema }),
 })
 
@@ -349,7 +370,7 @@ function nowSeconds() {
 }
 
 function emptyState(): State {
-  return { version: 1, projects: {} }
+  return { version: 2, projects: {} }
 }
 
 function isMissingStateFile(error: unknown) {
@@ -430,6 +451,21 @@ function parseStateText(raw: string, file: string) {
 }
 
 function decodeState(value: unknown) {
+  // Breaking change: v1 state (old plugin) is not supported. Start fresh
+  // instead of failing every operation forever.
+  if (typeof value === "object" && value !== null && (value as Record<string, unknown>).version === 1) {
+    if (!warnedEmptyStatePaths.has("__v1__")) {
+      warnedEmptyStatePaths.add("__v1__")
+      console.warn("[opencode-teamwork] Unsupported v1 project state found; starting fresh (old projects are not migrated).")
+      if (process.env.OPENCODE_TEAMWORK_DEBUG_V1) {
+        try {
+          console.warn(`[opencode-teamwork] v1 payload keys: ${Object.keys(value as object).join(",")}`)
+          console.warn(`[opencode-teamwork] v1 payload: ${JSON.stringify(value).slice(0, 500)}`)
+        } catch { /* ignore */ }
+      }
+    }
+    return Effect.succeed(emptyState())
+  }
   return Schema.decodeUnknown(StateSchema)(value).pipe(
     Effect.map(mutableState),
     Effect.map(normalizeState),
@@ -514,7 +550,11 @@ function readStateSync(): State {
   try {
     const file = statePath()
     const raw = readFileSync(file, "utf8")
-    return normalizeState(mutableState(Schema.decodeUnknownSync(StateSchema)(parseStateText(raw, file).value)))
+    const parsed = parseStateText(raw, file).value
+    if (typeof parsed === "object" && parsed !== null && (parsed as Record<string, unknown>).version === 1) {
+      return emptyState()
+    }
+    return normalizeState(mutableState(Schema.decodeUnknownSync(StateSchema)(parsed)))
   } catch (error) {
     if (isMissingStateFile(error)) return emptyState()
     throw error
@@ -602,6 +642,21 @@ function normalizeState(state: State): State {
   return state
 }
 
+function normalizeBrief(brief: Brief): Brief {
+  return {
+    name: brief.name,
+    objectives: brief.objectives,
+    requirements: brief.requirements,
+    verification: brief.verification,
+    acceptanceCriteria: brief.acceptanceCriteria,
+    integrityMode:
+      brief.integrityMode === "demo" || brief.integrityMode === "benchmark" ? brief.integrityMode : "development",
+    executionPath: normalizeExecutionPath((brief as { executionPath?: unknown }).executionPath),
+    teamScale: normalizeTeamScale((brief as { teamScale?: unknown }).teamScale),
+    deep: normalizeDeepFlag((brief as { deep?: unknown }).deep),
+  }
+}
+
 function normalizeProject(project: Project) {
   project.phase = isPhase(project.phase) ? project.phase : "awaitingApproval"
   project.milestones = (project.milestones ?? []).map(normalizeMilestone)
@@ -615,12 +670,8 @@ function normalizeProject(project: Project) {
   project.sessionsSpawned = nonNegativeInteger(project.sessionsSpawned, 0)
   project.maxAutoTurns = positiveIntegerOrNull(project.maxAutoTurns)
   project.maxDurationSeconds = positiveIntegerOrNull(project.maxDurationSeconds)
-  // Legacy projects without the field follow the global default (native).
-  // New projects persist the chosen executor explicitly.
   project.maxParallelWorkers = clampParallelWorkers(project.maxParallelWorkers)
-  project.maxVerificationRetries =
-    nonNegativeIntegerOrNull(project.maxVerificationRetries) ?? DEFAULT_MAX_VERIFICATION_RETRIES
-  project.executor = normalizeExecutorMode((project as { executor?: unknown }).executor)
+  project.brief = normalizeBrief(project.brief)
   const stall = (project as { trackStallReminderSeconds?: unknown }).trackStallReminderSeconds
   project.trackStallReminderSeconds =
     stall === null ? null : positiveIntegerOrNull(stall) ?? DEFAULT_TRACK_STALL_REMINDER_SECONDS
@@ -883,15 +934,17 @@ export async function createProject(
   options?: CreateProjectOptions,
   agent?: string | null,
 ) {
-  const normalizedBrief: Brief = {
+  const normalizedBrief: Brief = normalizeBrief({
     name: normalizeSlug(boundedText(brief.name, "project name", 200)),
     objectives: boundedText(brief.objectives, "project objectives"),
     requirements: boundedText(brief.requirements, "project requirements"),
     verification: boundedText(brief.verification, "project verification"),
     acceptanceCriteria: boundedText(brief.acceptanceCriteria, "acceptance criteria"),
     integrityMode: brief.integrityMode,
-    artifactLocale: brief.artifactLocale,
-  }
+    executionPath: (brief as { executionPath?: unknown }).executionPath as ExecutionPath,
+    teamScale: (brief as { teamScale?: unknown }).teamScale as TeamScale | null,
+    deep: (brief as { deep?: unknown }).deep as boolean,
+  })
   const workingDirectory =
     typeof options?.workingDirectory === "string" && options.workingDirectory.trim()
       ? options.workingDirectory.trim()
@@ -920,9 +973,6 @@ export async function createProject(
       maxAutoTurns: positiveIntegerOrNull(options?.maxAutoTurns),
       maxDurationSeconds: positiveIntegerOrNull(options?.maxDurationSeconds),
       maxParallelWorkers: clampParallelWorkers(options?.maxParallelWorkers),
-      maxVerificationRetries:
-        nonNegativeIntegerOrNull(options?.maxVerificationRetries) ?? DEFAULT_MAX_VERIFICATION_RETRIES,
-      executor: normalizeExecutorMode(options?.executor),
       trackStallReminderSeconds:
         options?.trackStallReminderSeconds === null
           ? null
@@ -949,72 +999,30 @@ export async function createProject(
 }
 
 /** Replaces the brief while still awaiting approval (after /teamwork-revise). */
-export async function updateProjectBrief(sessionID: string, brief: Brief, options?: { executor?: ExecutorMode | string | null }) {
-  const normalizedBrief: Brief = {
+export async function updateProjectBrief(sessionID: string, brief: Brief) {
+  const normalizedBrief: Brief = normalizeBrief({
     name: normalizeSlug(boundedText(brief.name, "project name", 200)),
     objectives: boundedText(brief.objectives, "project objectives"),
     requirements: boundedText(brief.requirements, "project requirements"),
     verification: boundedText(brief.verification, "project verification"),
     acceptanceCriteria: boundedText(brief.acceptanceCriteria, "acceptance criteria"),
     integrityMode: brief.integrityMode,
-    artifactLocale: brief.artifactLocale,
-  }
+    executionPath: (brief as { executionPath?: unknown }).executionPath as ExecutionPath,
+    teamScale: (brief as { teamScale?: unknown }).teamScale as TeamScale | null,
+    deep: (brief as { deep?: unknown }).deep as boolean,
+  })
   return mutate((state) => {
     const project = state.projects[sessionID]
     if (!project) throw new Error("cannot revise the project because this session has no project")
     if (isClosed(project.phase)) throw new Error("cannot revise the project because it is closed")
-    // Executor may be switched while awaiting approval or paused; the brief
-    // itself is only editable while awaiting approval.
-    if (project.phase !== "awaitingApproval" && project.phase !== "paused") {
+    if (project.phase !== "awaitingApproval") {
       throw new Error("the project brief can only be revised while awaiting approval")
     }
-    if (project.phase === "paused") {
-      if (
-        normalizedBrief.name !== project.slug ||
-        normalizedBrief.objectives !== project.brief.objectives ||
-        normalizedBrief.requirements !== project.brief.requirements ||
-        normalizedBrief.verification !== project.brief.verification ||
-        normalizedBrief.acceptanceCriteria !== project.brief.acceptanceCriteria ||
-        normalizedBrief.integrityMode !== project.brief.integrityMode ||
-        normalizedBrief.artifactLocale !== project.brief.artifactLocale
-      ) {
-        throw new Error("only the executor can be switched while paused; revise the brief while awaiting approval")
-      }
-      if (options?.executor == null) throw new Error("nothing to revise while paused: provide an executor")
-    } else {
-      project.brief = normalizedBrief
-      project.slug = normalizedBrief.name
-    }
-    if (options?.executor != null) {
-      const next = normalizeExecutorMode(options.executor)
-      if (next !== project.executor) {
-        project.executor = next
-        pushHistory(project, "updated", `Project executor switched to "${next}".`)
-      }
-    }
+    project.brief = normalizedBrief
+    project.slug = normalizedBrief.name
     project.updatedAt = nowSeconds()
-    project.lastStatus = project.phase === "paused" ? "Project executor switched while paused." : "Project brief revised; awaiting approval."
-    if (project.phase !== "paused") pushHistory(project, "updated", `Project brief revised for "${project.slug}".`)
-    return snapshot(project)
-  })
-}
-
-/** Switches the executor while awaiting approval or paused (executing is immutable). */
-export async function setProjectExecutor(sessionID: string, executor: ExecutorMode | string) {
-  const next = normalizeExecutorMode(executor)
-  return mutate((state) => {
-    const project = state.projects[sessionID]
-    if (!project) throw new Error("cannot switch the executor because this session has no project")
-    if (isClosed(project.phase)) throw new Error("cannot switch the executor because it is closed")
-    if (project.phase !== "awaitingApproval" && project.phase !== "paused") {
-      throw new Error("the executor can only be switched while awaiting approval or paused")
-    }
-    if (next !== project.executor) {
-      project.executor = next
-      project.updatedAt = nowSeconds()
-      project.lastStatus = `Project executor switched to "${next}".`
-      pushHistory(project, "updated", project.lastStatus)
-    }
+    project.lastStatus = "Project brief revised; awaiting approval."
+    pushHistory(project, "updated", `Project brief revised for "${project.slug}".`)
     return snapshot(project)
   })
 }
@@ -1037,7 +1045,7 @@ export async function suspendTimerForPermission(sessionID: string) {
   })
 }
 
-/** Submits a report against a track ID (native executor path has no role session). */
+/** Submits a report against a track ID (flat-topology path has no role session). */
 export async function submitTrackReportByID(
   projectSessionID: string,
   milestoneIndex: number,
@@ -1071,7 +1079,7 @@ export async function submitTrackReportByID(
 
 export async function setProjectArtifacts(
   sessionID: string,
-  artifacts: { request: string; plan: string; progress: string },
+  artifacts: { brief: string; request: string; plan: string; progress: string },
 ) {
   return mutate((state) => {
     const project = state.projects[sessionID]
@@ -1395,7 +1403,7 @@ export async function recordVerificationAttempt(sessionID: string, milestoneInde
     pushHistory(
       project,
       "verification",
-      `${milestone.id} verification attempt ${milestone.verificationAttempts}/${project.maxVerificationRetries + 1}`,
+      `${milestone.id} verification attempt ${milestone.verificationAttempts}`,
     )
     return snapshot(project)
   })
@@ -1522,18 +1530,19 @@ export function formatProject(project: ProjectSnapshot | null) {
   const lines = [
     `Project: ${project.slug}`,
     `Phase: ${project.phase}`,
+    `Path: ${project.brief.executionPath}`,
     `Integrity mode: ${project.brief.integrityMode}`,
-    `Executor: ${project.executor ?? "native"}`,
+    `Speed knobs: workers=${project.maxParallelWorkers}, team=${project.brief.teamScale ?? "default"}, deep=${project.brief.deep ? "on" : "off"}`,
     `Milestones: ${project.milestones.length}${
       project.activeMilestoneIndex >= 0 ? ` (active: m${project.activeMilestoneIndex + 1})` : ""
     }`,
-    `Parallel workers: ${project.maxParallelWorkers}`,
     `Time used: ${project.timeUsedSeconds}s`,
     `Tokens used: ${project.tokensUsed}${project.tokenBudget == null ? "" : `/${project.tokenBudget}`}`,
   ]
   if (project.remainingTokens != null) lines.push(`Tokens remaining: ${project.remainingTokens}`)
   if (project.maxDurationSeconds != null) lines.push(`Duration limit: ${project.maxDurationSeconds}s`)
   if (project.artifacts) {
+    lines.push(`Brief artifact: ${project.artifacts.brief}`)
     lines.push(`Request artifact: ${project.artifacts.request}`)
     lines.push(`Plan artifact: ${project.artifacts.plan}`)
     lines.push(`Progress artifact: ${project.artifacts.progress}`)

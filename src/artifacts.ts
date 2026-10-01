@@ -1,174 +1,122 @@
 import { mkdir, writeFile } from "node:fs/promises"
 import { join } from "node:path"
-import type { TeamworkLocale } from "./i18n"
 import type { Project } from "./state"
 
 /**
- * Teamwork artifacts are real markdown files under
- * `<repo>/.opencode/teamwork/<slug>/` so the user can review and edit them.
- * The plugin owns the writing: request.md from the approved brief, plan.md
- * from the orchestrator's milestone plan, progress.md from live track state.
+ * Teamwork artifacts are real markdown files under `<repo>/.teamwork/` so the
+ * user can review and edit them. The plugin owns the writing: brief.md from
+ * the approved Phase 1 brief, request.md from the same brief, plan.md from
+ * the orchestrator's milestone plan, progress.md from live track state.
  * The state JSON only stores pointers to these paths.
  */
 
-export function artifactDirPath(directory: string, slug: string) {
-  return join(directory, ".opencode", "teamwork", slug)
+export function artifactDirPath(directory: string) {
+  return join(directory, ".teamwork")
 }
 
-export function artifactPaths(directory: string, slug: string) {
-  const dir = artifactDirPath(directory, slug)
-  return { dir, request: join(dir, "request.md"), plan: join(dir, "plan.md"), progress: join(dir, "progress.md") }
+export function artifactPaths(directory: string) {
+  const dir = artifactDirPath(directory)
+  return {
+    dir,
+    brief: join(dir, "brief.md"),
+    request: join(dir, "request.md"),
+    plan: join(dir, "plan.md"),
+    progress: join(dir, "progress.md"),
+    scratch: join(dir, "scratch"),
+    knowledge: join(dir, "knowledge"),
+  }
 }
 
-const LABELS: Record<TeamworkLocale, Record<string, string>> = {
-  en: {
-    title: "Teamwork Project Request",
-    project: "Project",
-    workingDirectory: "Working directory",
-    integrityMode: "Integrity mode",
-    status: "Status",
-    objectives: "Objectives & scope",
-    requirements: "Requirements",
-    verification: "Independent verification",
-    acceptanceCriteria: "Acceptance criteria",
-    plan: "Teamwork Project Plan",
-    milestones: "Milestones",
-    noPlan: "The orchestrator has not recorded a milestone plan yet.",
-    progress: "Teamwork Progress",
-    phase: "Phase",
-    milestoneProgress: "Milestone progress",
-    latestUpdate: "Latest Sentinel update",
-    noUpdate: "No Sentinel update posted yet.",
-    tracks: "Tracks",
-    verdict: "verdict",
-    attempt: "attempt",
-  },
-  "zh-TW": {
-    title: "Teamwork 專案請求",
-    project: "專案",
-    workingDirectory: "工作目錄",
-    integrityMode: "完整性模式",
-    status: "狀態",
-    objectives: "目標與範疇",
-    requirements: "需求",
-    verification: "獨立驗證",
-    acceptanceCriteria: "驗收標準",
-    plan: "Teamwork 專案計畫",
-    milestones: "里程碑",
-    noPlan: "協調者尚未記錄里程碑計畫。",
-    progress: "Teamwork 進度",
-    phase: "階段",
-    milestoneProgress: "里程碑進度",
-    latestUpdate: "最新 Sentinel 更新",
-    noUpdate: "尚無 Sentinel 更新。",
-    tracks: "Track",
-    verdict: "判定",
-    attempt: "嘗試",
-  },
-  "zh-CN": {
-    title: "Teamwork 项目请求",
-    project: "项目",
-    workingDirectory: "工作目录",
-    integrityMode: "完整性模式",
-    status: "状态",
-    objectives: "目标与范畴",
-    requirements: "需求",
-    verification: "独立验证",
-    acceptanceCriteria: "验收标准",
-    plan: "Teamwork 项目计划",
-    milestones: "里程碑",
-    noPlan: "协调者尚未记录里程碑计划。",
-    progress: "Teamwork 进度",
-    phase: "阶段",
-    milestoneProgress: "里程碑进度",
-    latestUpdate: "最新 Sentinel 更新",
-    noUpdate: "尚无 Sentinel 更新。",
-    tracks: "Track",
-    verdict: "判定",
-    attempt: "尝试",
-  },
-}
-
-function labels(locale: TeamworkLocale) {
-  return LABELS[locale] ?? LABELS.en
-}
-
-const EXECUTOR_LABEL: Record<TeamworkLocale, string> = {
-  en: "Executor",
-  "zh-TW": "執行器",
-  "zh-CN": "执行器",
-}
-
-const PARALLEL_LABEL: Record<TeamworkLocale, string> = {
-  en: "Max parallel workers",
-  "zh-TW": "最大並行數",
-  "zh-CN": "最大并行数",
-}
-
-const NATIVE_NOTE: Record<TeamworkLocale, string> = {
-  en: "Native mode: prompt-level isolation only. Evidence must be verbatim command output; the Auditor reruns commands. Gates stay strict.",
-  "zh-TW": "Native 模式：僅 prompt 級隔離。Evidence 必須是原始命令輸出貼上；Auditor 會重跑命令。門禁強度不變。",
-  "zh-CN": "Native 模式：仅 prompt 级隔离。Evidence 必须是原始命令输出粘贴；Auditor 会重跑命令。门禁强度不变。",
-}
+export type ArtifactPaths = ReturnType<typeof artifactPaths>
 
 function iso(timestamp: number) {
   return new Date(timestamp * 1000).toISOString()
 }
 
-export function renderRequestArtifact(project: Project) {
-  const label = labels(project.brief.artifactLocale)
-  const executor = (project as { executor?: string }).executor ?? "native"
-  const parallel = (project as { maxParallelWorkers?: number }).maxParallelWorkers ?? 5
+function speedKnobs(project: Project) {
+  const team = project.brief.teamScale ?? "default"
+  const deep = project.brief.deep ? "on" : "off"
+  return `workers=${project.maxParallelWorkers}, team=${team}, deep=${deep}`
+}
+
+export function renderBriefArtifact(project: Project) {
   const lines = [
-    `# ${label.title}: ${project.slug}`,
+    `# Teamwork Project Brief: ${project.slug}`,
     "",
-    `- ${label.project}: ${project.slug}`,
-    `- ${label.workingDirectory}: ${project.workingDirectory ?? "n/a"}`,
-    `- ${label.integrityMode}: ${project.brief.integrityMode}`,
-    `- ${EXECUTOR_LABEL[project.brief.artifactLocale]}: ${executor}`,
-    `- ${PARALLEL_LABEL[project.brief.artifactLocale]}: ${parallel}`,
-    `- ${label.status}: ${project.phase}`,
+    `- Project: ${project.slug}`,
+    `- Working directory: ${project.workingDirectory ?? "n/a"}`,
+    `- Execution path: ${project.brief.executionPath}`,
+    `- Integrity mode: ${project.brief.integrityMode}`,
+    `- Speed knobs: ${speedKnobs(project)}`,
+    `- Status: ${project.phase}`,
     "",
-  ]
-  if (executor === "native") lines.push(`${NATIVE_NOTE[project.brief.artifactLocale]}`, "")
-  lines.push(
-    `## ${label.objectives}`,
+    `## Objectives & scope`,
     "",
     project.brief.objectives,
     "",
-    `## ${label.requirements}`,
+    `## Requirements`,
     "",
     project.brief.requirements,
     "",
-    `## ${label.verification}`,
+    `## Independent verification`,
     "",
     project.brief.verification,
     "",
-    `## ${label.acceptanceCriteria}`,
+    `## Acceptance criteria`,
     "",
     project.brief.acceptanceCriteria,
     "",
-  )
+  ]
+  return lines.join("\n")
+}
+
+export function renderRequestArtifact(project: Project) {
+  const lines = [
+    `# Teamwork Project Request: ${project.slug}`,
+    "",
+    `- Project: ${project.slug}`,
+    `- Working directory: ${project.workingDirectory ?? "n/a"}`,
+    `- Execution path: ${project.brief.executionPath}`,
+    `- Integrity mode: ${project.brief.integrityMode}`,
+    `- Speed knobs: ${speedKnobs(project)}`,
+    `- Status: ${project.phase}`,
+    "",
+    `## Objectives & scope`,
+    "",
+    project.brief.objectives,
+    "",
+    `## Requirements`,
+    "",
+    project.brief.requirements,
+    "",
+    `## Independent verification`,
+    "",
+    project.brief.verification,
+    "",
+    `## Acceptance criteria`,
+    "",
+    project.brief.acceptanceCriteria,
+    "",
+  ]
   return lines.join("\n")
 }
 
 export function renderPlanArtifact(project: Project) {
-  const label = labels(project.brief.artifactLocale)
-  const lines = [`# ${label.plan}: ${project.slug}`, ""]
+  const lines = [`# Teamwork Project Plan: ${project.slug}`, ""]
   if (project.milestones.length === 0) {
-    lines.push(`_${label.noPlan}_`, "")
+    lines.push(`_The orchestrator has not recorded a milestone plan yet._`, "")
     return lines.join("\n")
   }
-  lines.push(`## ${label.milestones}`, "")
+  lines.push(`## Milestones`, "")
   project.milestones.forEach((milestone, index) => {
     const active = index === project.activeMilestoneIndex ? " *(active)*" : ""
     lines.push(`### ${milestone.id}: ${milestone.title} [${milestone.status}]${active}`, "")
     lines.push(milestone.description, "")
     if (milestone.tracks.length > 0) {
-      lines.push(`**${label.tracks}:**`, "")
+      lines.push(`**Tracks:**`, "")
       for (const track of milestone.tracks) {
         const files = track.assignedFiles.length > 0 ? ` — files: ${track.assignedFiles.join(", ")}` : ""
-        const report = track.lastReport ? ` — ${label.verdict}: ${track.lastReport.verdict}` : ""
+        const report = track.lastReport ? ` — verdict: ${track.lastReport.verdict}` : ""
         lines.push(`- ${track.id} [${track.status}] (${track.role}) ${track.title}${files}${report}`)
       }
       lines.push("")
@@ -178,25 +126,25 @@ export function renderPlanArtifact(project: Project) {
 }
 
 export function renderProgressArtifact(project: Project) {
-  const label = labels(project.brief.artifactLocale)
   const lines = [
-    `# ${label.progress}: ${project.slug}`,
+    `# Teamwork Progress: ${project.slug}`,
     "",
-    `- ${label.phase}: ${project.phase}`,
-    `- ${label.milestoneProgress}: ${project.milestones.filter((m) => m.status === "passed").length}/${project.milestones.length}`,
+    `- Phase: ${project.phase}`,
+    `- Path: ${project.brief.executionPath}`,
+    `- Milestone progress: ${project.milestones.filter((m) => m.status === "passed").length}/${project.milestones.length}`,
     "",
   ]
   if (project.sentinelUpdate) {
-    lines.push(`## ${label.latestUpdate}`, "", `- ${iso(project.sentinelUpdate.timestamp)} — ${project.sentinelUpdate.message}`, "")
+    lines.push(`## Latest Sentinel update`, "", `- ${iso(project.sentinelUpdate.timestamp)} — ${project.sentinelUpdate.message}`, "")
   } else {
-    lines.push(`## ${label.latestUpdate}`, "", `_${label.noUpdate}_`, "")
+    lines.push(`## Latest Sentinel update`, "", `_No Sentinel update posted yet._`, "")
   }
-  lines.push(`## ${label.milestoneProgress}`, "")
+  lines.push(`## Milestone progress`, "")
   for (const milestone of project.milestones) {
     lines.push(`- ${milestone.id} [${milestone.status}] ${milestone.title}`)
     for (const track of milestone.tracks) {
-      const report = track.lastReport ? ` — ${label.verdict}: ${track.lastReport.verdict}` : ""
-      lines.push(`  - ${track.id} [${track.status}] (${track.role}, ${label.attempt} ${track.attempt}) ${track.title}${report}`)
+      const report = track.lastReport ? ` — verdict: ${track.lastReport.verdict}` : ""
+      lines.push(`  - ${track.id} [${track.status}] (${track.role}, attempt ${track.attempt}) ${track.title}${report}`)
     }
   }
   lines.push("")
@@ -208,19 +156,33 @@ async function writeFileAtomicallyEnough(path: string, content: string) {
   await writeFile(path, content, "utf8")
 }
 
-/** Writes all three artifacts and returns their paths. */
+/** Writes all four artifacts plus scratch/knowledge dirs; returns their paths. */
 export async function writeArtifacts(directory: string, project: Project) {
-  const paths = artifactPaths(directory, project.slug)
+  const paths = artifactPaths(directory)
   await mkdir(paths.dir, { recursive: true, mode: 0o700 })
+  await mkdir(paths.scratch, { recursive: true, mode: 0o700 })
+  if (project.brief.executionPath === "math" || project.brief.executionPath === "math-large") {
+    await mkdir(paths.knowledge, { recursive: true, mode: 0o700 })
+    const pitfalls = join(paths.knowledge, "pitfalls.md")
+    try {
+      await writeFile(pitfalls, "# Pitfall Registry\n\nDocument failed approaches and invalid lemmas here.\n", {
+        encoding: "utf8",
+        flag: "wx",
+      })
+    } catch {
+      // Already exists; keep the accumulated registry.
+    }
+  }
+  await writeFileAtomicallyEnough(paths.brief, renderBriefArtifact(project))
   await writeFileAtomicallyEnough(paths.request, renderRequestArtifact(project))
   await writeFileAtomicallyEnough(paths.plan, renderPlanArtifact(project))
   await writeFileAtomicallyEnough(paths.progress, renderProgressArtifact(project))
-  return { request: paths.request, plan: paths.plan, progress: paths.progress }
+  return { brief: paths.brief, request: paths.request, plan: paths.plan, progress: paths.progress }
 }
 
 /** Refreshes the plan and progress artifacts after state changes. */
 export async function refreshPlanAndProgress(directory: string, project: Project) {
-  const paths = artifactPaths(directory, project.slug)
+  const paths = artifactPaths(directory)
   await writeFileAtomicallyEnough(paths.plan, renderPlanArtifact(project))
   await writeFileAtomicallyEnough(paths.progress, renderProgressArtifact(project))
   return { plan: paths.plan, progress: paths.progress }

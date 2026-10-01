@@ -5,7 +5,7 @@
 //   /teamwork          -> teamwork_create_project
 //   /teamwork-approve  -> teamwork_approve (the plugin state machine takes over)
 //   orchestrator       -> teamwork_submit_plan
-//   explorer/worker/critic/auditor/successAuditor -> teamwork_report (pass)
+//   explorer/worker/critic/challenger/auditor/successAuditor -> teamwork_report (pass)
 // and the smoke asserts the project reaches phase "complete" with artifacts
 // written on disk.
 import assert from "node:assert/strict"
@@ -31,7 +31,12 @@ const ROLE_MARKERS: Array<[string, string]> = [
   ["You are a Worker", "worker"],
   ["You are the Critic", "critic"],
   ["You are the Challenger", "challenger"],
-  ["You are the Auditor of", "auditor"],
+  ["You are the Auditor", "auditor"],
+  ["You are a Prover", "prover"],
+  ["You are the Falsifier", "falsifier"],
+  ["You are the Verifier", "verifier"],
+  ["You are a Reviewer", "reviewer"],
+  ["You are the Synthesizer", "synthesizer"],
   ["You are the Success Auditor", "successAuditor"],
 ]
 
@@ -119,7 +124,7 @@ const model = Bun.serve({
       if (role !== null) {
         toolName = role === "orchestrator" ? "teamwork_submit_plan" : "teamwork_report"
         args = role === "orchestrator" ? PLAN : reportArgs(role)
-      } else if (userText.includes("You are the Teamwork scoping interviewer")) {
+      } else if (userText.includes("call the teamwork_create_project tool")) {
         toolName = "teamwork_create_project"
         args = {
           name: "fastify-migration",
@@ -128,10 +133,9 @@ const model = Bun.serve({
           verification: "The migrated server must pass the full integration test suite.",
           acceptance_criteria: "npm test passes with zero failures on the Fastify server.",
           integrity_mode: "development",
-          artifact_locale: "en",
-          // Pin the smoke to the isolated executor so the lifecycle asserts
-          // session.create hygiene; native fan-out is covered by unit tests.
-          executor: "isolated",
+          execution_path: "general",
+          team_scale: null,
+          deep: true,
           max_parallel_workers: 5,
         }
       } else if (userText.includes("teamwork_approve")) {
@@ -313,11 +317,13 @@ try {
       return false
     }
   })
-  const requestArtifact = join(project, ".opencode", "teamwork", "fastify-migration", "request.md")
+  const briefArtifact = join(project, ".teamwork", "brief.md")
+  const requestArtifact = join(project, ".teamwork", "request.md")
   await waitFor("request-artifact", async () => {
     try {
-      const content = await readFile(requestArtifact, "utf8")
-      return content.includes("fastify-migration")
+      const brief = await readFile(briefArtifact, "utf8")
+      const request = await readFile(requestArtifact, "utf8")
+      return brief.includes("fastify-migration") && request.includes("fastify-migration")
     } catch {
       return false
     }

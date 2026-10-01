@@ -10,13 +10,12 @@ import {
   setMilestoneStatus,
   setSentinelUpdate,
   submitTrackReport,
-  submitTrackReportByID,
   suspendTimerForPermission,
 } from "./state"
-import type { ExecutorMode, Milestone, Project, TeamRole, Track } from "./state"
+import type { ExecutionPath, Milestone, Project, TeamRole, Track } from "./state"
 import {
   agentNameForRole,
-  nativeBatchPrompt,
+  findOwnershipConflicts,
   permissionApprovalPrompt,
   roleTaskPrompt,
   sentinelDecisionPrompt,
@@ -24,15 +23,20 @@ import {
   ROLE_AGENT_SYSTEM_PROMPTS,
 } from "./prompts"
 import type { RoleAgentName } from "./prompts"
-import { refreshPlanAndProgress, writeArtifacts } from "./artifacts"
+import { artifactDirPath, refreshPlanAndProgress, writeArtifacts } from "./artifacts"
 import { setProjectArtifacts } from "./state"
-import type { TeamworkLocale } from "./i18n"
+import { join } from "node:path"
 
 /**
  * The Teamwork state machine ("Sentinel"). The engine drives role sessions
- * through a deterministic sequence — orchestrator plan, then per-milestone
- * explore / implement / verify gates, then a fresh Success Auditor — enforcing
- * the verification gates that pure prompting cannot.
+ * through a deterministic per-path sequence — orchestrator plan, then
+ * per-milestone explore / build / verify gates, then a fresh Success Auditor
+ * — enforcing the verification gates that pure prompting cannot.
+ *
+ * Gates follow skill-teamwork/roles/orchestrator.md per execution path.
+ * There is no fixed retry ceiling: a failed gate sends the work back to the
+ * builders with the failing verdict as context and re-runs the gate. The run
+ * stops only on pass or on user pause/cancel.
  *
  * All OpenCode session operations go through `SessionOps` so the engine is
  * testable against fakes with a temporary state file.
@@ -89,7 +93,6 @@ export type SessionOps = {
 
 export type EngineOptions = {
   directory: string
-  locale: TeamworkLocale
 }
 
 /** Prefix for role session titles so users can spot teamwork sessions at a glance. */
@@ -123,19 +126,11 @@ function createDeferred<T>(): Deferred<T> {
 type ProjectRuntime = {
   sessionID: string
   directory: string
-  locale: TeamworkLocale
   aborted: boolean
   activeRoleSessions: Set<string>
   reportWaiters: Map<string, Deferred<ReportPayload>>
   planWaiter: Deferred<PlanMilestoneInput[]> | null
   planWaiterOwner: string | null
-  successWaiter: Deferred<ReportPayload> | null
-  nativeBatch: {
-    expected: Array<{ milestoneIndex: number; trackID: string; role: TeamRole }>
-    received: number
-    resolve: () => void
-    reject: (error: unknown) => void
-  } | null
   stallTimers: Map<string, ReturnType<typeof setTimeout>>
   stallNotified: Set<string>
   runner: Promise<void>
@@ -147,6 +142,25 @@ type ProjectRuntime = {
 function withRoleIdentity(role: TeamRole | RoleAgentName, agentApplied: boolean, taskText: string) {
   if (agentApplied) return taskText
   return `${ROLE_AGENT_SYSTEM_PROMPTS[role as RoleAgentName]}\n\n---\n\n${taskText}`
+}
+
+/** Builder roles produce candidate changes per execution path. */
+function builderRolesFor(path: ExecutionPath): TeamRole[] {
+  switch (path) {
+    case "general":
+    case "iterative":
+      return ["worker"]
+    case "review":
+      return ["reviewer", "synthesizer"]
+    case "math":
+    case "math-large":
+      return ["prover"]
+  }
+}
+
+/** Roles allowed to edit files/scratch per path (everything else is read-only). */
+export function isEditingRole(role: TeamRole): boolean {
+  return role === "worker" || role === "challenger" || role === "prover" || role === "falsifier" || role === "synthesizer"
 }
 
 export class TeamEngine {
@@ -171,19 +185,16 @@ export class TeamEngine {
   }
 
   /** Starts (or restarts) the autonomous runner for an executing project. */
-  startExecution(sessionID: string, locale: TeamworkLocale = this.options.locale) {
+  startExecution(sessionID: string) {
     if (this.runtimes.has(sessionID)) return
     const runtime: ProjectRuntime = {
       sessionID,
       directory: this.options.directory,
-      locale,
       aborted: false,
       activeRoleSessions: new Set(),
       reportWaiters: new Map(),
       planWaiter: null,
       planWaiterOwner: null,
-      successWaiter: null,
-      nativeBatch: null,
       stallTimers: new Map(),
       stallNotified: new Set(),
       runner: Promise.resolve(),
@@ -200,9 +211,6 @@ export class TeamEngine {
       .finally(() => {
         for (const timer of runtime.stallTimers.values()) clearTimeout(timer)
         runtime.stallTimers.clear()
-        for (const key of [...this.nativeDoneKeys]) {
-          if (key.startsWith(`${sessionID}:`)) this.nativeDoneKeys.delete(key)
-        }
         this.runtimes.delete(sessionID)
         for (const [roleSessionID, owner] of this.roleOwners) {
           if (owner === sessionID) this.roleOwners.delete(roleSessionID)
@@ -214,68 +222,13 @@ export class TeamEngine {
   /** Resolves the pending report waiter for a role session (tool hook). */
   onReport(roleSessionID: string, report: ReportPayload) {
     for (const runtime of this.runtimes.values()) {
-      // Native success audit reports through the main session.
-      if (runtime.successWaiter && roleSessionID === runtime.sessionID && report.role === "successAuditor") {
-        runtime.successWaiter.resolve(report)
-        return
-      }
-      // Native batches report through the main session: match by role in order.
-      if (runtime.nativeBatch && roleSessionID === runtime.sessionID) {
-        const batch = runtime.nativeBatch
-        if (batch.expected.length === 1 && batch.expected[0]!.milestoneIndex === -1) {
-          // Success-audit bridge is handled via successWaiter; ignore here.
-        } else {
-          const next = batch.expected.find(
-            (entry) => entry.role === report.role && !this.nativeTrackDone(runtime, entry),
-          )
-          const target = next ?? batch.expected[batch.received]
-          if (target) {
-            this.markNativeTrackDone(runtime, target)
-            void this.handleNativeReport(runtime, target, report)
-            batch.received += 1
-            if (batch.received >= batch.expected.length) {
-              const resolve = batch.resolve
-              runtime.nativeBatch = null
-              resolve()
-            }
-            return
-          }
-        }
-      }
       const waiter = runtime.reportWaiters.get(roleSessionID)
       if (waiter) waiter.resolve(report)
     }
   }
 
-  private readonly nativeDoneKeys = new Set<string>()
-  private nativeKey(runtime: ProjectRuntime, entry: { milestoneIndex: number; trackID: string }) {
-    return `${runtime.sessionID}:${entry.milestoneIndex}:${entry.trackID}`
-  }
-  private nativeTrackDone(runtime: ProjectRuntime, entry: { milestoneIndex: number; trackID: string }) {
-    return this.nativeDoneKeys.has(this.nativeKey(runtime, entry))
-  }
-  private markNativeTrackDone(runtime: ProjectRuntime, entry: { milestoneIndex: number; trackID: string }) {
-    this.nativeDoneKeys.add(this.nativeKey(runtime, entry))
-    // Bound the set: runtimes are short-lived; cleanup happens on runner finally.
-  }
-
-  private async handleNativeReport(
-    runtime: ProjectRuntime,
-    target: { milestoneIndex: number; trackID: string; role: TeamRole },
-    report: ReportPayload,
-  ) {
-    try {
-      await submitTrackReportByID(runtime.sessionID, target.milestoneIndex, target.trackID, report)
-      this.clearStallTimer(runtime, `native:${target.milestoneIndex}:${target.trackID}`)
-      await this.broadcastTrackReport(runtime, target.milestoneIndex, target.trackID, report)
-    } catch {
-      // Submission failures surface through the batch waiter rejection path.
-    }
-  }
-
   /** Resolves the pending plan waiter for a role session (tool hook). */
   onPlan(roleSessionID: string, plan: PlanMilestoneInput[]) {
-    // Native orchestrator plans report through the main session.
     for (const runtime of this.runtimes.values()) {
       if (runtime.planWaiter && runtime.planWaiterOwner != null && roleSessionID === runtime.planWaiterOwner) {
         runtime.planWaiter.resolve(plan)
@@ -316,13 +269,7 @@ export class TeamEngine {
           await this.ops
             .promptMain(
               runtime.sessionID,
-              permissionApprovalPrompt({
-                locale: runtime.locale,
-                projectSlug: project.slug,
-                trackID,
-                role,
-                detail,
-              }),
+              permissionApprovalPrompt({ projectSlug: project.slug, trackID, role, detail }),
             )
             .catch(() => undefined)
         } catch {
@@ -379,7 +326,7 @@ export class TeamEngine {
       if (!project) return
       for (const milestone of project.milestones) {
         for (const track of milestone.tracks) {
-          if (!track.sessionID || track.sessionID.startsWith("native-")) continue
+          if (!track.sessionID) continue
           const removed = await this.ops.removeSession(track.sessionID).catch(() => false)
           if (!removed) {
             await this.ops
@@ -405,14 +352,6 @@ export class TeamEngine {
       runtime.planWaiter = null
       runtime.planWaiterOwner = null
     }
-    if (runtime.successWaiter) {
-      runtime.successWaiter.reject(new AbortedError())
-      runtime.successWaiter = null
-    }
-    if (runtime.nativeBatch) {
-      runtime.nativeBatch.reject(new AbortedError())
-      runtime.nativeBatch = null
-    }
     for (const timer of runtime.stallTimers.values()) clearTimeout(timer)
     runtime.stallTimers.clear()
     await Promise.allSettled(interruptions)
@@ -435,7 +374,6 @@ export class TeamEngine {
       await this.ops.promptMain(
         runtime.sessionID,
         sentinelDecisionPrompt({
-          locale: runtime.locale,
           projectSlug: project?.slug ?? runtime.sessionID,
           message: `The team stopped unexpectedly: ${detail}. The project is paused; resume it with /teamwork-resume after checking the environment.`,
         }),
@@ -443,13 +381,6 @@ export class TeamEngine {
     } catch {
       // Nothing more can be done if even the failure path fails.
     }
-  }
-
-  // -------------------------------------------------------------------------
-
-  private executorOf(project: Project): ExecutorMode {
-    const value = (project as { executor?: unknown }).executor
-    return value === "isolated" ? "isolated" : "native"
   }
 
   private clearStallTimer(runtime: ProjectRuntime, key: string) {
@@ -527,7 +458,6 @@ export class TeamEngine {
       await refreshPlanAndProgress(runtime.directory, project).catch(() => undefined)
       const counts = await this.queueCounts(runtime.sessionID)
       const summary = trackSummaryPrompt({
-        locale: runtime.locale,
         projectSlug: project.slug,
         trackID,
         role: report.role,
@@ -555,8 +485,8 @@ export class TeamEngine {
     if (!project) throw new Error("project not found")
     this.assertActive(runtime, project)
 
-    // Write the request artifact (from the approved brief) and persist the
-    // artifact pointers so sessions and the TUI can reference the files.
+    // Write the brief + request artifacts (from the approved brief) and persist
+    // the artifact pointers so sessions and the TUI can reference the files.
     const artifacts = await writeArtifacts(runtime.directory, project)
     await setProjectArtifacts(sessionID, artifacts)
 
@@ -588,51 +518,9 @@ export class TeamEngine {
   private async runOrchestratorPlan(
     runtime: ProjectRuntime,
     project: Project,
-    artifacts: { request: string; plan: string; progress: string },
+    artifacts: { brief: string; request: string; plan: string; progress: string },
   ) {
     const { sessionID } = runtime
-    if (this.executorOf(project) === "native") {
-      const syntheticID = `native-${sessionID.slice(0, 8)}-orchestrator`
-      await recordAdhocSession(sessionID, "orchestrator", syntheticID)
-      const planWaiter = createDeferred<PlanMilestoneInput[]>()
-      runtime.planWaiter = planWaiter
-      runtime.planWaiterOwner = sessionID
-      try {
-        const taskText = roleTaskPrompt({
-          role: "orchestrator",
-          projectSlug: project.slug,
-          workingDirectory: project.workingDirectory ?? runtime.directory,
-          artifactPaths: artifacts,
-          integrityMode: project.brief.integrityMode,
-          taskTitle: "Produce the milestone plan (native: fan out with subagents if it helps)",
-          taskDetail:
-            "Read the request artifact, then break the approved brief into structured milestones. " +
-            "For each milestone: give a short title, a description of the outcome, and the work tracks. " +
-            "Track roles must be one of: explorer, worker, critic, challenger, auditor. " +
-            "The final milestone must make the project's acceptance criteria verifiable end to end. " +
-            "Every milestone must include at least one critic track and one auditor track as its verification " +
-            "gates. Assign each worker track an exclusive file list so tracks never edit the same file. " +
-            "Isolation is prompt-level in native mode; still keep file ownership exclusive. " +
-            "Submit the plan through the teamwork_submit_plan tool.",
-          assignedFiles: [],
-          scratchDirectory: null,
-          attemptContext: null,
-          executorMode: "native",
-        })
-        await this.ops.promptMain(sessionID, taskText)
-        const plan = await planWaiter.promise
-        const persisted = await setMilestonePlan(sessionID, plan)
-        await refreshPlanAndProgress(runtime.directory, persisted)
-        await this.ops.sendSynthetic(
-          sessionID,
-          `[Teamwork Sentinel] Plan ready for "${persisted.slug}": ${persisted.milestones.length} milestones.`,
-        )
-      } finally {
-        runtime.planWaiter = null
-        runtime.planWaiterOwner = null
-      }
-      return
-    }
     const { sessionID: orchestratorSession, agentApplied } = await this.spawnRoleSession(runtime, "orchestrator", project)
     await recordAdhocSession(sessionID, "orchestrator", orchestratorSession)
     runtime.roleAgentApplied.set(orchestratorSession, agentApplied)
@@ -646,24 +534,30 @@ export class TeamEngine {
         role: "orchestrator",
         projectSlug: project.slug,
         workingDirectory: project.workingDirectory ?? runtime.directory,
-        artifactPaths: artifacts,
         integrityMode: project.brief.integrityMode,
+        executionPath: project.brief.executionPath,
+        workers: project.maxParallelWorkers,
+        teamScale: project.brief.teamScale,
+        deep: project.brief.deep,
+        artifactPaths: artifacts,
         taskTitle: "Produce the milestone plan",
         taskDetail:
-          "Read the request artifact, then break the approved brief into structured milestones. " +
+          "Read the brief artifact, then break the approved brief into structured milestones. " +
           "For each milestone: give a short title, a description of the outcome, and the work tracks. " +
-          "Track roles must be one of: explorer, worker, critic, challenger, auditor. " +
-          "The final milestone must make the project's acceptance criteria verifiable end to end. " +
-          "Every milestone must include at least one critic track and one auditor track as its verification " +
-          "gates. Assign each worker track an exclusive file list so tracks never edit the same file. " +
+          trackRolesForPath(project.brief.executionPath) +
+          " The final milestone must make the project's acceptance criteria verifiable end to end. " +
+          "Every builder milestone must include its path's verification gate tracks. " +
+          "Assign each builder track an exclusive file list so tracks never edit the same file. " +
           "Submit the plan through the teamwork_submit_plan tool.",
         assignedFiles: [],
+        contextPacket: null,
+        acceptanceCriteria: [project.brief.acceptanceCriteria],
         scratchDirectory: null,
         attemptContext: null,
-        executorMode: "isolated",
       })
       await this.ops.promptSession(orchestratorSession, withRoleIdentity("orchestrator", agentApplied, taskText))
       const plan = await planWaiter.promise
+      this.validateRawPlanOrThrow(project, plan)
       const persisted = await setMilestonePlan(sessionID, plan)
       await refreshPlanAndProgress(runtime.directory, persisted)
       await this.ops.sendSynthetic(
@@ -677,75 +571,104 @@ export class TeamEngine {
     }
   }
 
+  /** Enforces path rules + exclusive ownership before the plan is persisted. */
+  private validateRawPlanOrThrow(project: Project, plan: PlanMilestoneInput[]) {
+    const path = project.brief.executionPath
+    project.milestones = plan.map((milestone, milestoneIndex) => ({
+      id: `m${milestoneIndex + 1}`,
+      title: milestone.title,
+      description: milestone.description,
+      status: "pending" as const,
+      verificationAttempts: 0,
+      tracks: (milestone.tracks ?? []).map((track, trackIndex) => ({
+        id: `m${milestoneIndex + 1}t${trackIndex + 1}`,
+        title: track.title,
+        role: track.role,
+        assignedFiles: track.assignedFiles,
+        status: "queued" as const,
+        sessionID: null,
+        attempt: 0,
+        lastReport: null,
+      })),
+    }))
+    this.validatePlanOrThrow(project)
+  }
+
+  /** Enforces path rules + exclusive ownership on the orchestrator's plan. */
+  private validatePlanOrThrow(project: Project) {
+    const path = project.brief.executionPath
+    for (const milestone of project.milestones) {
+      const builders = milestone.tracks.filter((track) => builderRolesFor(path).includes(track.role))
+      if (path === "iterative" && builders.length > 1) {
+        throw new Error(
+          `Milestone ${milestone.id} violates the Iterative path: it never decomposes into parallel tracks ` +
+            `(${builders.length} builder tracks).`,
+        )
+      }
+      const conflicts = findOwnershipConflicts(
+        milestone.tracks
+          .filter((track) => builderRolesFor(path).includes(track.role))
+          .map((track) => ({ title: track.title, assignedFiles: track.assignedFiles })),
+      )
+      if (conflicts.length > 0) {
+        throw new Error(`Milestone ${milestone.id} violates exclusive file ownership: ${conflicts.join("; ")}`)
+      }
+    }
+  }
+
   private async runMilestone(runtime: ProjectRuntime, milestoneIndex: number) {
     const { sessionID } = runtime
     const project = (await getProject(sessionID))!
     const milestone = project.milestones[milestoneIndex]!
     if (!milestone) throw new Error(`milestone ${milestoneIndex} not found`)
+    const path = project.brief.executionPath
 
     await setMilestoneStatus(sessionID, milestoneIndex, "inProgress")
     await setSentinelUpdate(sessionID, `Milestone ${milestone.id} started: ${milestone.title}`)
 
-    const research = milestone.tracks.filter((track) => track.role === "explorer")
-    const implementation = milestone.tracks.filter((track) => track.role === "worker")
+    const explorers = milestone.tracks.filter((track) => track.role === "explorer")
+    const builders = milestone.tracks.filter((track) => builderRolesFor(path).includes(track.role))
 
-    if (research.length > 0) {
-      await this.runTracksParallel(runtime, milestoneIndex, research)
+    if (explorers.length > 0) {
+      await this.runTracksParallel(runtime, milestoneIndex, explorers)
       this.assertActive(runtime, (await getProject(sessionID))!)
     }
-    if (implementation.length > 0) {
-      await this.runTracksParallel(runtime, milestoneIndex, implementation)
-      this.assertActive(runtime, (await getProject(sessionID))!)
+    if (builders.length > 0) {
+      if (path === "review") {
+        // Reviewers first (parallel angles), then the synthesizer adjudicates.
+        const reviewers = builders.filter((track) => track.role === "reviewer")
+        const synthesizers = builders.filter((track) => track.role === "synthesizer")
+        if (reviewers.length > 0) {
+          await this.runTracksParallel(runtime, milestoneIndex, reviewers)
+          this.assertActive(runtime, (await getProject(sessionID))!)
+        }
+        if (synthesizers.length > 0) {
+          await this.runTracksParallel(runtime, milestoneIndex, synthesizers)
+          this.assertActive(runtime, (await getProject(sessionID))!)
+        }
+      } else {
+        await this.runTracksParallel(runtime, milestoneIndex, builders)
+        this.assertActive(runtime, (await getProject(sessionID))!)
+      }
     }
 
-    // Research-only milestones (no worker tracks) produce no candidate changes,
+    // Research-only milestones (no builder tracks) produce no candidate changes,
     // so there is nothing to verify adversarially; they pass once their
-    // exploration reports land. Implementation milestones go through the gates.
-    if (implementation.length === 0) {
+    // exploration reports land.
+    if (builders.length === 0) {
       await this.finishMilestone(runtime, milestoneIndex, milestone)
       return
     }
 
-    // Adversarial verification gates: Critic and Challenger in parallel, then
-    // the Auditor. A failed gate sends the work back to the workers, reusing
-    // their sessions within this milestone (context continuity), until the
-    // retry ceiling is reached and the project pauses for the user.
+    // Adversarial verification gates per path. A failed gate sends the work
+    // back to the builders with the failing verdict as context, then re-runs
+    // the failed gate. There is no fixed retry ceiling: the loop ends on pass
+    // or on user pause/cancel.
     for (;;) {
       this.assertActive(runtime, (await getProject(sessionID))!)
       const gateResult = await this.runVerificationGates(runtime, milestoneIndex)
       if (gateResult === "passed") break
-      const current = (await getProject(sessionID))!
-      const milestoneNow = current.milestones[milestoneIndex]!
-      const attempts = milestoneNow.verificationAttempts
-      const maxAttempts = current.maxVerificationRetries + 1
-      if (attempts >= maxAttempts) {
-        const blockers = milestoneNow.tracks
-          .map((track) => track.lastReport?.blockers ?? [])
-          .flat()
-          .slice(0, 6)
-        await pauseProject(
-          sessionID,
-          `Milestone ${milestoneNow.id} failed verification ${attempts} time(s): ${milestoneNow.title}`,
-          {
-            stopReason: "verification failed",
-            blocker: blockers.length > 0 ? blockers.join("; ") : `Milestone ${milestoneNow.id} failed verification.`,
-            historyType: "verification",
-          },
-        )
-        const paused = (await getProject(sessionID))!
-        await this.ops.promptMain(
-          sessionID,
-          sentinelDecisionPrompt({
-            locale: runtime.locale,
-            projectSlug: paused.slug,
-            message: `Milestone ${milestoneNow.id} failed verification ${attempts} time(s) and the retry ceiling was reached. The project is paused.`,
-            details: blockers.length > 0 ? blockers : [`Milestone: ${milestoneNow.title}`],
-          }),
-        )
-        throw new AbortedError()
-      }
-      // Send the work back to the workers of this milestone (same sessions).
-      await this.sendWorkersBackToWork(runtime, milestoneIndex)
+      await this.sendBuildersBackToWork(runtime, milestoneIndex)
     }
 
     await this.finishMilestone(runtime, milestoneIndex, milestone)
@@ -767,62 +690,130 @@ export class TeamEngine {
     await recordVerificationAttempt(sessionID, milestoneIndex)
     const project = (await getProject(sessionID))!
     const milestone = project.milestones[milestoneIndex]!
-    const critics = milestone.tracks.filter((track) => track.role === "critic")
-    const challengers = milestone.tracks.filter((track) => track.role === "challenger")
-    const auditors = milestone.tracks.filter((track) => track.role === "auditor")
+    const path = project.brief.executionPath
+    const deep = project.brief.deep
 
-    // The Orchestrator plan should define verification tracks; if it did not,
-    // the milestone cannot pass: treat the missing gates as a failure.
-    if (critics.length === 0 || auditors.length === 0) {
-      await setSentinelUpdate(
-        sessionID,
-        `Milestone ${milestone.id} has no verification tracks (critic/auditor); the gate fails until the plan includes them.`,
-      )
-      return "failed"
-    }
+    const byRole = (role: TeamRole) => milestone.tracks.filter((track) => track.role === role)
 
-    const gateTracks = [...critics, ...challengers]
-    await this.runTracksParallel(runtime, milestoneIndex, gateTracks)
-    // Re-read the project: the gate tracks' reports landed in state during
-    // runTracksParallel, so the snapshot captured above is stale.
-    const afterGates = (await getProject(runtime.sessionID))!
-    if (!this.gatesPassed(afterGates.milestones[milestoneIndex]!, gateTracks.map((track) => track.id))) {
-      return "failed"
+    switch (path) {
+      case "general": {
+        // explorer -> workers -> critic -> challenger (skip when deep=off) -> auditor
+        const critics = byRole("critic")
+        const challengers = deep ? byRole("challenger") : []
+        const auditors = byRole("auditor")
+        if (critics.length === 0 || auditors.length === 0) {
+          return await this.failGateForMissingTracks(runtime, milestone, "critic/auditor")
+        }
+        await this.runTracksParallel(runtime, milestoneIndex, critics)
+        if (!this.gatesPassed((await getProject(runtime.sessionID))!.milestones[milestoneIndex]!, critics)) return "failed"
+        if (challengers.length > 0) {
+          await this.runTracksParallel(runtime, milestoneIndex, challengers)
+          if (!this.gatesPassed((await getProject(runtime.sessionID))!.milestones[milestoneIndex]!, challengers)) {
+            return "failed"
+          }
+        }
+        await this.runTracksParallel(runtime, milestoneIndex, auditors)
+        return this.gatesPassed((await getProject(runtime.sessionID))!.milestones[milestoneIndex]!, auditors)
+          ? "passed"
+          : "failed"
+      }
+      case "iterative": {
+        // single worker -> critic -> auditor; challenger only when deep=on and explicitly planned.
+        const critics = byRole("critic")
+        const challengers = deep ? byRole("challenger") : []
+        const auditors = byRole("auditor")
+        if (critics.length === 0 || auditors.length === 0) {
+          return await this.failGateForMissingTracks(runtime, milestone, "critic/auditor")
+        }
+        await this.runTracksParallel(runtime, milestoneIndex, critics)
+        if (!this.gatesPassed((await getProject(runtime.sessionID))!.milestones[milestoneIndex]!, critics)) return "failed"
+        if (challengers.length > 0) {
+          await this.runTracksParallel(runtime, milestoneIndex, challengers)
+          if (!this.gatesPassed((await getProject(runtime.sessionID))!.milestones[milestoneIndex]!, challengers)) {
+            return "failed"
+          }
+        }
+        await this.runTracksParallel(runtime, milestoneIndex, auditors)
+        return this.gatesPassed((await getProject(runtime.sessionID))!.milestones[milestoneIndex]!, auditors)
+          ? "passed"
+          : "failed"
+      }
+      case "review": {
+        // reviewers -> synthesizer (build phase) -> critic -> auditor. No source edits.
+        const critics = byRole("critic")
+        const auditors = byRole("auditor")
+        if (critics.length === 0 || auditors.length === 0) {
+          return await this.failGateForMissingTracks(runtime, milestone, "critic/auditor")
+        }
+        await this.runTracksParallel(runtime, milestoneIndex, critics)
+        if (!this.gatesPassed((await getProject(runtime.sessionID))!.milestones[milestoneIndex]!, critics)) return "failed"
+        await this.runTracksParallel(runtime, milestoneIndex, auditors)
+        return this.gatesPassed((await getProject(runtime.sessionID))!.milestones[milestoneIndex]!, auditors)
+          ? "passed"
+          : "failed"
+      }
+      case "math":
+      case "math-large": {
+        // prover candidates -> falsifier (skip when deep=off; large team always pairs) -> verifier.
+        const falsifiers = path === "math-large" || deep ? byRole("falsifier") : []
+        const verifiers = byRole("verifier")
+        if (verifiers.length === 0) {
+          return await this.failGateForMissingTracks(runtime, milestone, "verifier")
+        }
+        if (falsifiers.length > 0) {
+          await this.runTracksParallel(runtime, milestoneIndex, falsifiers)
+          if (!this.gatesPassed((await getProject(runtime.sessionID))!.milestones[milestoneIndex]!, falsifiers)) {
+            return "failed"
+          }
+        }
+        await this.runTracksParallel(runtime, milestoneIndex, verifiers)
+        return this.gatesPassed((await getProject(runtime.sessionID))!.milestones[milestoneIndex]!, verifiers)
+          ? "passed"
+          : "failed"
+      }
     }
-
-    await this.runTracksParallel(runtime, milestoneIndex, auditors)
-    const afterAudit = (await getProject(runtime.sessionID))!
-    if (!this.gatesPassed(afterAudit.milestones[milestoneIndex]!, auditors.map((track) => track.id))) {
-      return "failed"
-    }
-    return "passed"
   }
 
   /** A gate passes only when every gate track has a "pass" verdict. */
-  private gatesPassed(milestone: Milestone, trackIDs: string[]) {
-    const tracks = milestone.tracks.filter((track) => trackIDs.includes(track.id))
-    if (tracks.length === 0) return false
-    return tracks.every((track) => track.lastReport?.verdict === "pass")
+  private gatesPassed(milestone: Milestone, tracks: Track[]) {
+    const ids = new Set(tracks.map((track) => track.id))
+    const current = milestone.tracks.filter((track) => ids.has(track.id))
+    if (current.length === 0) return false
+    return current.every((track) => track.lastReport?.verdict === "pass")
   }
 
-  private async sendWorkersBackToWork(runtime: ProjectRuntime, milestoneIndex: number) {
+  private async failGateForMissingTracks(
+    runtime: ProjectRuntime,
+    milestone: Milestone,
+    expected: string,
+  ): Promise<"failed"> {
+    // A plan without its path's gate tracks can never pass; pausing (rather
+    // than looping forever) hands the broken plan back to the user.
+    const project = (await getProject(runtime.sessionID))!
+    await pauseProject(
+      runtime.sessionID,
+      `Milestone ${milestone.id} has no verification tracks (${expected}); the plan must include them.`,
+      { stopReason: "plan invalid", blocker: `Milestone ${milestone.id} is missing ${expected} tracks.` },
+    )
+    await this.ops.promptMain(
+      runtime.sessionID,
+      sentinelDecisionPrompt({
+        projectSlug: project.slug,
+        message: `Milestone ${milestone.id} is missing its ${expected} verification tracks. The project is paused; fix the milestone plan and resume.`,
+      }),
+    )
+    throw new AbortedError()
+  }
+
+  private async sendBuildersBackToWork(runtime: ProjectRuntime, milestoneIndex: number) {
     const project = (await getProject(runtime.sessionID))!
     const milestone = project.milestones[milestoneIndex]!
-    const workers = milestone.tracks.filter((track) => track.role === "worker" && track.sessionID)
-    if (this.executorOf(project) === "native") {
-      await this.runNativeBatch(
-        runtime,
-        milestoneIndex,
-        workers.map((track) => ({
-          ...track,
-          title: `Fix and complete: ${track.title}`,
-        })),
-        "Independent verification rejected the previous attempt for these tracks. Address every finding, re-run the relevant tests and builds, and resubmit one report per track.",
-      )
-      return
-    }
+    const path = project.brief.executionPath
+    const builders = milestone.tracks.filter(
+      (track) => builderRolesFor(path).includes(track.role) && track.sessionID,
+    )
     await Promise.all(
-      workers.map(async (track) => {
+      builders.map(async (track) => {
         const feedback = track.lastReport
           ? [
               `Prior attempt verdict: ${track.lastReport.verdict}.`,
@@ -830,26 +821,15 @@ export class TeamEngine {
               ...track.lastReport.blockers.slice(0, 4).map((blocker) => `- blocker: ${blocker}`),
             ].join("\n")
           : "Prior attempt had no report."
+        const gateFindings = milestone.tracks
+          .filter((candidate) => candidate.lastReport?.verdict === "fail")
+          .flatMap((candidate) => candidate.lastReport!.findings.slice(0, 4))
         runtime.reportWaiters.delete(track.sessionID!)
         await this.ops.promptSession(
           track.sessionID!,
-          roleTaskPrompt({
-            role: "worker",
-            projectSlug: project.slug,
-            workingDirectory: project.workingDirectory ?? runtime.directory,
-            artifactPaths: project.artifacts,
-            integrityMode: project.brief.integrityMode,
-            taskTitle: `Fix and complete: ${track.title}`,
-            taskDetail:
-              "Independent verification rejected the previous attempt for this track. Address every finding, " +
-              "re-run the relevant tests and builds yourself, and resubmit the report.",
-            assignedFiles: track.assignedFiles,
-            scratchDirectory: null,
-            attemptContext: feedback,
-            executorMode: "isolated",
-          }),
+          this.taskPromptFor(project, runtime, milestoneIndex, track.title, track, gateFindings.join("\n") || feedback),
         )
-        const report = await this.awaitReport(runtime, track.sessionID!, track.id, "worker", track.title)
+        const report = await this.awaitReport(runtime, track.sessionID!, track.id, track.role, track.title)
         await submitTrackReport(track.sessionID!, report)
         await this.broadcastTrackReport(runtime, milestoneIndex, track.id, report)
       }),
@@ -859,12 +839,9 @@ export class TeamEngine {
   /** Runs the given tracks with bounded parallelism; waits for all reports. */
   private async runTracksParallel(runtime: ProjectRuntime, milestoneIndex: number, tracks: Track[]) {
     const project = (await getProject(runtime.sessionID))!
-    if (this.executorOf(project) === "native") {
-      const milestone = project.milestones[milestoneIndex]!
-      await this.runNativeBatch(runtime, milestoneIndex, tracks, milestone.description)
-      return
-    }
-    const limit = Math.min(8, Math.max(1, project.maxParallelWorkers))
+    // The Iterative path never parallelizes.
+    const limit =
+      project.brief.executionPath === "iterative" ? 1 : Math.min(8, Math.max(1, project.maxParallelWorkers))
     const queue = [...tracks]
     const workers: Array<Promise<void>> = []
     for (let slot = 0; slot < Math.min(limit, queue.length); slot += 1) {
@@ -882,76 +859,57 @@ export class TeamEngine {
     await Promise.all(workers)
   }
 
-  /**
-   * Native executor: one main-session batch prompt, parallel fan-out by the
-   * model's own subagents, one teamwork_report per track relayed by the main
-   * LLM. Reports arrive through onReport keyed by the main session ID.
-   */
-  private async runNativeBatch(
+  private taskPromptFor(
+    project: Project,
     runtime: ProjectRuntime,
     milestoneIndex: number,
-    tracks: Track[],
-    milestoneDescription: string,
-  ) {
-    const project = (await getProject(runtime.sessionID))!
+    title: string,
+    track: Track,
+    attemptContext: string | null,
+  ): string {
     const milestone = project.milestones[milestoneIndex]!
-    // Assign synthetic session IDs so state tracks running/attempt counts and
-    // maxAutoTurns without creating real sessions.
-    for (const track of tracks) {
-      const syntheticID = `native-${runtime.sessionID.slice(0, 8)}-${track.id}-${Date.now().toString(36)}`
-      await assignTrackSession(runtime.sessionID, milestoneIndex, track.id, syntheticID)
-    }
-    const refreshed = (await getProject(runtime.sessionID))!
-    const batchTracks = tracks.map((track) => ({
-      id: track.id,
-      title: track.title,
+    return roleTaskPrompt({
       role: track.role,
+      projectSlug: project.slug,
+      workingDirectory: project.workingDirectory ?? runtime.directory,
+      integrityMode: project.brief.integrityMode,
+      executionPath: project.brief.executionPath,
+      workers: project.maxParallelWorkers,
+      teamScale: project.brief.teamScale,
+      deep: project.brief.deep,
+      artifactPaths: project.artifacts,
+      taskTitle: title,
+      taskDetail: milestone.description,
       assignedFiles: track.assignedFiles,
-      scratch:
-        track.role === "challenger"
-          ? `${runtime.directory}/.opencode/teamwork/${refreshed.slug}/scratch`
-          : null,
-    }))
-    const batchText = nativeBatchPrompt({
-      projectSlug: refreshed.slug,
-      workingDirectory: refreshed.workingDirectory ?? runtime.directory,
-      artifactPaths: refreshed.artifacts,
-      integrityMode: refreshed.brief.integrityMode,
-      milestoneID: milestone.id,
-      milestoneTitle: milestone.title,
-      milestoneDescription,
-      tracks: batchTracks,
+      contextPacket: this.contextPacketFor(project, milestoneIndex),
+      acceptanceCriteria: [project.brief.acceptanceCriteria],
+      scratchDirectory: isEditingRole(track.role)
+        ? join(artifactDirPath(project.workingDirectory ?? runtime.directory), "scratch", track.id)
+        : null,
+      attemptContext,
     })
-    const deferred = createDeferred<void>()
-    runtime.nativeBatch = {
-      expected: tracks.map((track) => ({ milestoneIndex, trackID: track.id, role: track.role })),
-      received: 0,
-      resolve: () => deferred.resolve(),
-      reject: (error: unknown) => deferred.reject(error as Error),
+  }
+
+  /** Builds the Context Packet from the milestone's explorer reports. */
+  private contextPacketFor(project: Project, milestoneIndex: number): string | null {
+    const milestone = project.milestones[milestoneIndex]
+    if (!milestone) return null
+    const explorers = milestone.tracks.filter(
+      (track) => track.role === "explorer" && track.lastReport?.verdict === "pass",
+    )
+    if (explorers.length === 0) return null
+    const lines: string[] = []
+    for (const track of explorers) {
+      const report = track.lastReport!
+      lines.push(`Explorer ${track.id} (${track.title}):`)
+      for (const finding of report.findings.slice(0, 10)) lines.push(`- ${finding}`)
+      for (const evidence of report.evidence.slice(0, 6)) lines.push(`- evidence: ${evidence}`)
     }
-    for (const track of tracks) {
-      this.scheduleStallReminder(
-        runtime,
-        `native:${milestoneIndex}:${track.id}`,
-        track.id,
-        track.role,
-        track.title,
-        refreshed.trackStallReminderSeconds,
-      )
-    }
-    try {
-      await this.ops.promptMain(runtime.sessionID, batchText)
-      await deferred.promise
-      this.assertActive(runtime, (await getProject(runtime.sessionID))!)
-    } finally {
-      for (const track of tracks) this.clearStallTimer(runtime, `native:${milestoneIndex}:${track.id}`)
-      if (runtime.nativeBatch) runtime.nativeBatch = null
-    }
+    return lines.join("\n")
   }
 
   private async runTrack(runtime: ProjectRuntime, milestoneIndex: number, track: Track) {
     const project = (await getProject(runtime.sessionID))!
-    const milestone = project.milestones[milestoneIndex]!
     const { sessionID: roleSessionID, agentApplied } = await this.spawnRoleSession(runtime, track.role, project)
     await assignTrackSession(runtime.sessionID, milestoneIndex, track.id, roleSessionID)
     runtime.roleAgentApplied.set(roleSessionID, agentApplied)
@@ -964,21 +922,10 @@ export class TeamEngine {
       project.trackStallReminderSeconds,
     )
     try {
-      const taskText = roleTaskPrompt({
-        role: track.role,
-        projectSlug: project.slug,
-        workingDirectory: project.workingDirectory ?? runtime.directory,
-        artifactPaths: project.artifacts,
-        integrityMode: project.brief.integrityMode,
-        taskTitle: track.title,
-        taskDetail: milestone.description,
-        assignedFiles: track.assignedFiles,
-        scratchDirectory:
-          track.role === "challenger" ? `${runtime.directory}/.opencode/teamwork/${project.slug}/scratch` : null,
-        attemptContext: null,
-        executorMode: "isolated",
-      })
-      await this.ops.promptSession(roleSessionID, withRoleIdentity(track.role, agentApplied, taskText))
+      await this.ops.promptSession(
+        roleSessionID,
+        withRoleIdentity(track.role, agentApplied, this.taskPromptFor(project, runtime, milestoneIndex, track.title, track, null)),
+      )
       const report = await this.awaitReport(runtime, roleSessionID, track.id, track.role, track.title)
       await submitTrackReport(roleSessionID, report)
       await this.broadcastTrackReport(runtime, milestoneIndex, track.id, report)
@@ -991,46 +938,6 @@ export class TeamEngine {
 
   private async runSuccessAudit(runtime: ProjectRuntime) {
     const project = (await getProject(runtime.sessionID))!
-    if (this.executorOf(project) === "native") {
-      const syntheticID = `native-${runtime.sessionID.slice(0, 8)}-successAuditor`
-      await recordAdhocSession(runtime.sessionID, "successAuditor", syntheticID)
-      const waiter = createDeferred<ReportPayload>()
-      runtime.successWaiter = waiter
-      this.scheduleStallReminder(
-        runtime,
-        syntheticID,
-        "success-audit",
-        "successAuditor",
-        "End-to-end success audit",
-        project.trackStallReminderSeconds,
-      )
-      try {
-        const taskText = roleTaskPrompt({
-          role: "successAuditor",
-          projectSlug: project.slug,
-          workingDirectory: project.workingDirectory ?? runtime.directory,
-          artifactPaths: project.artifacts,
-          integrityMode: project.brief.integrityMode,
-          taskTitle: "End-to-end success audit (native: fan out verification with subagents)",
-          taskDetail:
-            "All milestones passed their gates. Run a full end-to-end verification pass against the request " +
-            "artifact's acceptance criteria: build, test, and run the project for real. Every criterion must be " +
-            "verified with verbatim command output. Isolation is prompt-level; still rerun every claimed command yourself. " +
-            "Submit the result through the teamwork_report tool with role successAuditor.",
-          assignedFiles: [],
-          scratchDirectory: null,
-          attemptContext: null,
-          executorMode: "native",
-        })
-        await this.ops.promptMain(runtime.sessionID, taskText)
-        const report = await waiter.promise
-        await this.finishSuccessAuditWithReport(runtime, project, report)
-      } finally {
-        this.clearStallTimer(runtime, syntheticID)
-        runtime.successWaiter = null
-      }
-      return
-    }
     const { sessionID: successSession, agentApplied } = await this.spawnRoleSession(runtime, "successAuditor", project)
     await recordAdhocSession(runtime.sessionID, "successAuditor", successSession)
     this.scheduleStallReminder(
@@ -1046,17 +953,21 @@ export class TeamEngine {
         role: "successAuditor",
         projectSlug: project.slug,
         workingDirectory: project.workingDirectory ?? runtime.directory,
-        artifactPaths: project.artifacts,
         integrityMode: project.brief.integrityMode,
+        executionPath: project.brief.executionPath,
+        workers: project.maxParallelWorkers,
+        teamScale: project.brief.teamScale,
+        deep: project.brief.deep,
+        artifactPaths: project.artifacts,
         taskTitle: "End-to-end success audit",
         taskDetail:
-          "All milestones passed their gates. Run a full end-to-end verification pass against the request " +
-          "artifact's acceptance criteria: build, test, and run the project for real. Every criterion must be " +
-          "verified with command output.",
+          "All milestones passed their gates. Run a targeted end-to-end verification pass over the Context " +
+          "Packet paths against the brief's acceptance criteria. Partial passes are failures.",
         assignedFiles: [],
+        contextPacket: this.contextPacketFor(project, project.milestones.length - 1),
+        acceptanceCriteria: [project.brief.acceptanceCriteria],
         scratchDirectory: null,
         attemptContext: null,
-        executorMode: "isolated",
       })
       await this.ops.promptSession(successSession, withRoleIdentity("successAuditor", agentApplied, taskText))
       const report = await this.awaitReport(runtime, successSession, "success-audit", "successAuditor", "audit")
@@ -1079,7 +990,6 @@ export class TeamEngine {
       await this.ops.promptMain(
         runtime.sessionID,
         sentinelDecisionPrompt({
-          locale: runtime.locale,
           projectSlug: project.slug,
           message: "The Success Auditor rejected the completed project. The project is paused for review.",
           details: blockers.slice(0, 6),
@@ -1119,22 +1029,21 @@ export class TeamEngine {
   /**
    * Collects every role session belonging to this project: milestone tracks
    * (via state) plus the engine's runtime cache. Returns unique IDs.
-   * Native synthetic IDs (native-*) are not real sessions and are skipped.
    */
   private async roleSessionIDsFor(runtime: ProjectRuntime): Promise<string[]> {
     const sessionIDs = new Set<string>()
     for (const [roleSessionID, owner] of this.roleOwners) {
-      if (owner === runtime.sessionID && !roleSessionID.startsWith("native-")) sessionIDs.add(roleSessionID)
+      if (owner === runtime.sessionID) sessionIDs.add(roleSessionID)
     }
     for (const sessionID of runtime.activeRoleSessions) {
-      if (!sessionID.startsWith("native-")) sessionIDs.add(sessionID)
+      sessionIDs.add(sessionID)
     }
     try {
       const project = await getProject(runtime.sessionID)
       if (project) {
         for (const milestone of project.milestones) {
           for (const track of milestone.tracks) {
-            if (track.sessionID && !track.sessionID.startsWith("native-")) sessionIDs.add(track.sessionID)
+            if (track.sessionID) sessionIDs.add(track.sessionID)
           }
         }
       }
@@ -1197,5 +1106,35 @@ export class TeamEngine {
       void sessionEnded.catch(() => undefined)
       runtime.reportWaiters.delete(roleSessionID)
     }
+  }
+}
+
+function trackRolesForPath(path: ExecutionPath): string {
+  switch (path) {
+    case "general":
+      return (
+        "Track roles for the General path must be: explorer (research), worker (implementation, parallel), " +
+        "critic and challenger (verification gates), auditor (evidence audit)."
+      )
+    case "iterative":
+      return (
+        "Track roles for the Iterative path must be: explorer (quick, may be omitted when obvious), a single " +
+        "worker (never parallelize), critic and auditor (verification gates)."
+      )
+    case "review":
+      return (
+        "Track roles for the Document Review path must be: reviewer (parallel angles), synthesizer " +
+        "(adjudicated review), critic and auditor (verification gates). No workers, no source edits."
+      )
+    case "math":
+      return (
+        "Track roles for the Math path must be: prover candidates, falsifier, verifier (single tournament round). " +
+        "Failed drafts stay attached with objections."
+      )
+    case "math-large":
+      return (
+        "Track roles for the Math Large Team path must be: parallel prover candidates each paired with a " +
+        "falsifier, verifier synthesis per subproblem node. Maintain .teamwork/knowledge/."
+      )
   }
 }

@@ -53,6 +53,8 @@ test("published files include every module in the tui import closure", () => {
   // entrypoint must also ship — otherwise the host fails with
   // "Cannot find module './...'". Walk the closure and assert coverage.
   const shipped = new Set(packageJson.files ?? [])
+  const fileShipped = (path: string) =>
+    shipped.has(path) || [...shipped].some((entry) => entry.endsWith("/") && path.startsWith(entry))
   const visited = new Set<string>()
   const queue = [tuiEntry.replace(/^\.\//, "")]
   const relativeImport = /from\s+["'](\.[^"']*)["']/g
@@ -60,12 +62,23 @@ test("published files include every module in the tui import closure", () => {
     const current = queue.pop()!
     if (visited.has(current)) continue
     visited.add(current)
-    expect(shipped.has(current)).toBe(true)
+    expect(fileShipped(current)).toBe(true)
     const source = readFileSync(current, "utf8")
     for (const match of source.matchAll(relativeImport)) {
       const specifier = match[1]!
+      if (specifier.endsWith(".generated")) continue
       const resolved = join(dirname(current), specifier).replace(/\\/g, "/")
       queue.push(resolved.endsWith(".ts") ? resolved : `${resolved}.ts`)
     }
+  }
+})
+
+test("published files ship the skill-teamwork prompt source and no i18n", () => {
+  const packageJson = JSON.parse(readFileSync("package.json", "utf8")) as { files?: string[] }
+  const files = packageJson.files ?? []
+  expect(files.some((entry) => entry.startsWith("skill-teamwork"))).toBe(true)
+  expect(files.some((entry) => entry.includes("i18n"))).toBe(false)
+  for (const role of ["roles/sentinel.md", "roles/orchestrator.md", "roles/shared/base.md", "SKILL.md"]) {
+    expect(readFileSync(join("skill-teamwork", role), "utf8").length).toBeGreaterThan(0)
   }
 })

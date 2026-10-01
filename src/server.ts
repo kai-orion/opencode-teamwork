@@ -3,7 +3,7 @@ import type * as PluginV2 from "@opencode/plugin"
 import type { Info as ToolV2Info } from "@opencode/plugin/promise/tool"
 import type { Tool as ToolSchema } from "@opencode/schema/tool"
 import { appendFileSync } from "node:fs"
-import { TeamEngine, TEAMWORK_TITLE_PREFIX } from "./engine"
+import { TeamEngine, TEAMWORK_TITLE_PREFIX, isEditingRole } from "./engine"
 import type { PlanMilestoneInput, ReportPayload, SessionOps } from "./engine"
 import { writeArtifacts } from "./artifacts"
 import {
@@ -36,25 +36,19 @@ import {
   formatProjectDetail,
   markProjectPlanPaused,
 } from "./state"
-import type { TeamRole } from "./state"
-import type { IntegrityMode, TeamworkMessages } from "./i18n"
-import { isTeamworkLocale, messagesFor, resolveLocale } from "./i18n"
+import type { ExecutionPath, TeamRole, TeamScale } from "./state"
 
 // ---------------------------------------------------------------------------
-// Options
+// Options (English only; no locale, no executor, no retry ceiling)
 // ---------------------------------------------------------------------------
 
 type Options = {
   register_command?: boolean
-  locale?: string
   max_parallel_workers?: number
-  max_verification_retries?: number
   default_token_budget?: number
   max_auto_turns?: number
   max_duration_seconds?: number
   restricted_agents?: string[]
-  executor?: string
-  default_executor?: string
   track_stall_reminder_seconds?: number | null
 }
 
@@ -65,21 +59,9 @@ function positiveIntegerOrNull(value: unknown) {
   return typeof value === "number" && Number.isSafeInteger(value) && value > 0 ? value : null
 }
 
-function nonNegativeIntegerOrNull(value: unknown) {
-  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : null
-}
-
 function restrictedAgentSet(options?: Options) {
   const names = Array.isArray(options?.restricted_agents) ? options.restricted_agents : DEFAULT_RESTRICTED_AGENTS
   return new Set(names.map((name) => (typeof name === "string" ? name.trim().toLowerCase() : "")).filter(Boolean))
-}
-
-function normalizeExecutorOption(value: unknown): "native" | "isolated" | null {
-  return value === "native" || value === "isolated" ? value : null
-}
-
-function defaultExecutorFromOptions(options?: Options): "native" | "isolated" {
-  return normalizeExecutorOption(options?.executor) ?? normalizeExecutorOption(options?.default_executor) ?? "native"
 }
 
 function clampParallelWorkersOption(value: unknown): number | null {
@@ -95,6 +77,55 @@ function stallReminderFromOptions(options?: Options): number | null | undefined 
 }
 
 // ---------------------------------------------------------------------------
+// English-only tool/command copy
+// ---------------------------------------------------------------------------
+
+const MESSAGES = {
+  commands: {
+    teamworkDescription: "Start a Teamwork project: scoping interview, then an autonomous multi-agent build",
+    approveDescription: "Approve the reviewed brief artifact and start Phase 2 execution",
+    reviseDescription: "Apply revision instructions to the brief artifact and wait for approval again",
+    statusDescription: "Show the current Teamwork project status",
+    pauseDescription: "Pause the running Teamwork team",
+    resumeDescription: "Resume the paused Teamwork team",
+    cancelDescription: "Cancel the Teamwork project for this session",
+  },
+  tools: {
+    createProject:
+      "Commit the Phase 1 scoping interview results as a Teamwork project. Call this only after the interview has " +
+      "converged: the user has confirmed objectives, requirements, independent verification, acceptance criteria, " +
+      "the working directory, an integrity mode, and an execution path. This persists the brief artifact, records " +
+      "the project state, and returns the artifact paths for the user to review.",
+    submitReport:
+      "Submit the structured final report for the currently assigned teamwork task. Required before the task " +
+      "session ends: a session that finishes without submitting this report is treated as having failed the task.",
+    getProject:
+      "Get the current Teamwork project for this OpenCode session, including phase, execution path, integrity mode, " +
+      "milestone progress, active tracks, budgets, and the latest Sentinel update.",
+    projectName: "Short project slug used for identification (kebab-case).",
+    brief: "Project objectives and scope: what to build, its purpose, and the audience.",
+    requirements: "Requirement blocks covering what the user actually cares about.",
+    verification: "Independent verification method per requirement: test suites, benchmarks, or rubric-judged review.",
+    acceptanceCriteria: "Clear, testable criteria for considering the project complete.",
+    integrityMode: "Verification strictness: development (default), demo, or benchmark.",
+    executionPath: "Execution path: general (default), iterative, review, math, or math-large.",
+    teamScale: "Team scale for the Large Team math path: S, M, or L. Null for other paths.",
+    deep: "Deep verification on/off (default on). Off skips the challenger/falsifier depth.",
+    role: "The reporting role.",
+    verdict: "The role's verdict: pass, fail, or blocked.",
+    findings: "Concrete findings from this role's pass.",
+    evidence: "Concrete evidence: command output, test results, file references.",
+    blockers: "Anything blocking this task from proceeding.",
+    artifactsWritten: "Paths of files this role created or modified, if any.",
+    tokenBudget: "Optional positive token budget for the whole team (all role sessions combined).",
+    maxAutoTurns: "Optional cap on the number of role sessions the team may spawn.",
+    maxDurationSeconds: "Optional wall-clock limit for the whole project.",
+    maxParallelWorkers: "Max parallel tracks within a phase (default 5, cap 8).",
+    trackStallReminderSeconds: "Per-track soft stall reminder in seconds (default 1800); null disables. Reminder only, never fails the track.",
+  },
+}
+
+// ---------------------------------------------------------------------------
 // Role agent registration
 // ---------------------------------------------------------------------------
 
@@ -105,12 +136,9 @@ type RoleAgentDefinition = {
 
 const ROLE_AGENT_DEFINITIONS: RoleAgentDefinition[] = ROLE_AGENT_NAMES.map((role) => ({
   role,
-  // Explorers and every verification role must not modify sources. The
-  // orchestrator plans and routes only; workers and the challenger (which
-  // writes adversarial probe scripts) may edit.
-  permission: {
-    edit: role === "worker" || role === "challenger" ? "allow" : "deny",
-  },
+  // Builders and adversarial probers write scratch/synthesis artifacts; every
+  // verification role is strictly read-only over project sources.
+  permission: { edit: isEditingRole(role) ? "allow" : "deny" },
 }))
 
 function agentConfigEntries() {
@@ -212,25 +240,42 @@ const INTEGRITY_ENUM = {
   enum: ["development", "demo", "benchmark"],
 }
 
-const LOCALE_ENUM = {
+const EXECUTION_PATH_ENUM = {
   type: "string",
-  enum: ["en", "zh-TW", "zh-CN"],
+  enum: ["general", "iterative", "review", "math", "math-large"],
 }
 
-const EXECUTOR_ENUM = {
-  type: "string",
-  enum: ["native", "isolated"],
+const TEAM_SCALE_ENUM = {
+  type: ["string", "null"],
+  enum: ["S", "M", "L", null],
 }
 
-const BRIEF_PROPERTIES = (messages: TeamworkMessages) => ({
-  name: TEXT_SCHEMA(messages.tools.projectName),
-  objectives: TEXT_SCHEMA(messages.tools.brief),
-  requirements: TEXT_SCHEMA(messages.tools.requirements),
-  verification: TEXT_SCHEMA(messages.tools.verification),
-  acceptance_criteria: TEXT_SCHEMA(messages.tools.acceptanceCriteria),
-  integrity_mode: { ...INTEGRITY_ENUM, description: messages.tools.integrityMode },
-  artifact_locale: { ...LOCALE_ENUM, description: messages.tools.artifactLocale },
-})
+const TRACK_ROLES = [
+  "explorer",
+  "worker",
+  "critic",
+  "challenger",
+  "auditor",
+  "prover",
+  "falsifier",
+  "verifier",
+  "reviewer",
+  "synthesizer",
+]
+
+const REPORT_ROLES = [...TRACK_ROLES, "orchestrator", "successAuditor"]
+
+const BRIEF_PROPERTIES = {
+  name: TEXT_SCHEMA(MESSAGES.tools.projectName),
+  objectives: TEXT_SCHEMA(MESSAGES.tools.brief),
+  requirements: TEXT_SCHEMA(MESSAGES.tools.requirements),
+  verification: TEXT_SCHEMA(MESSAGES.tools.verification),
+  acceptance_criteria: TEXT_SCHEMA(MESSAGES.tools.acceptanceCriteria),
+  integrity_mode: { ...INTEGRITY_ENUM, description: MESSAGES.tools.integrityMode },
+  execution_path: { ...EXECUTION_PATH_ENUM, description: MESSAGES.tools.executionPath },
+  team_scale: { ...TEAM_SCALE_ENUM, description: MESSAGES.tools.teamScale },
+  deep: { type: "boolean", description: MESSAGES.tools.deep },
+}
 
 type BriefArgs = {
   name: string
@@ -239,11 +284,12 @@ type BriefArgs = {
   verification: string
   acceptance_criteria: string
   integrity_mode?: "development" | "demo" | "benchmark"
-  artifact_locale?: string
+  execution_path?: ExecutionPath
+  team_scale?: TeamScale | null
+  deep?: boolean
   token_budget?: number | null
   max_auto_turns?: number | null
   max_duration_seconds?: number | null
-  executor?: "native" | "isolated" | null
   max_parallel_workers?: number | null
   track_stall_reminder_seconds?: number | null
 }
@@ -388,18 +434,13 @@ async function setupV2(context: PluginV2.Plugin.Context): Promise<PluginV2.Plugi
   trace("setup: start")
   const options = (context.options ?? {}) as Options
   const registerCommand = options.register_command ?? true
-  const locale = resolveLocale(options.locale)
-  const messages = messagesFor(locale)
   const directory = context.location?.directory ?? process.cwd()
   const planAgents = restrictedAgentSet(options)
   const isPlanAgent = (agent: unknown) =>
     typeof agent === "string" && planAgents.has(agent.trim().toLowerCase())
 
   const agentSupport = { namedAgents: false }
-  const engine = new TeamEngine(
-    sessionOps(context, agentSupport),
-    { directory, locale },
-  )
+  const engine = new TeamEngine(sessionOps(context, agentSupport), { directory })
 
   const registrations: Array<{ dispose(): Promise<void> }> = []
   let disposed = false
@@ -474,13 +515,13 @@ async function setupV2(context: PluginV2.Plugin.Context): Promise<PluginV2.Plugi
     const existingCommands = new Set(listed.map((command) => command.name))
     trace(`setup: command.list -> ${existingCommands.size} existing`)
     const commandDefinitions = [
-      { name: "teamwork", description: messages.commands.teamworkDescription, template: teamworkCommandTemplate(locale) },
-      { name: "teamwork-approve", description: messages.commands.approveDescription, template: approveCommandTemplate(locale) },
-      { name: "teamwork-revise", description: messages.commands.reviseDescription, template: reviseCommandTemplate(locale) },
-      { name: "teamwork-status", description: messages.commands.statusDescription, template: statusCommandTemplate(locale) },
-      { name: "teamwork-pause", description: messages.commands.pauseDescription, template: pauseCommandTemplate(locale) },
-      { name: "teamwork-resume", description: messages.commands.resumeDescription, template: resumeCommandTemplate(locale) },
-      { name: "teamwork-cancel", description: messages.commands.cancelDescription, template: cancelCommandTemplate(locale) },
+      { name: "teamwork", description: MESSAGES.commands.teamworkDescription, template: teamworkCommandTemplate() },
+      { name: "teamwork-approve", description: MESSAGES.commands.approveDescription, template: approveCommandTemplate() },
+      { name: "teamwork-revise", description: MESSAGES.commands.reviseDescription, template: reviseCommandTemplate() },
+      { name: "teamwork-status", description: MESSAGES.commands.statusDescription, template: statusCommandTemplate() },
+      { name: "teamwork-pause", description: MESSAGES.commands.pauseDescription, template: pauseCommandTemplate() },
+      { name: "teamwork-resume", description: MESSAGES.commands.resumeDescription, template: resumeCommandTemplate() },
+      { name: "teamwork-cancel", description: MESSAGES.commands.cancelDescription, template: cancelCommandTemplate() },
     ]
     try {
       registrations.push(
@@ -512,7 +553,7 @@ async function setupV2(context: PluginV2.Plugin.Context): Promise<PluginV2.Plugi
 
     try {
       await context.tool.transform((draft) => {
-        for (const tool of teamworkToolsV2({ messages, options, engine, directory })) draft.add(tool)
+        for (const tool of teamworkToolsV2({ options, engine, directory })) draft.add(tool)
       })
       trace("setup: tools registered")
     } catch (error) {
@@ -526,7 +567,7 @@ async function setupV2(context: PluginV2.Plugin.Context): Promise<PluginV2.Plugi
       // Role sessions carry their own agent system prompt; the reminder is
       // only for main sessions.
       if (typeof sessionContext.agent === "string" && sessionContext.agent.startsWith(TEAMWORK_AGENT_PREFIX)) return
-      const reminder = systemReminder(locale)
+      const reminder = systemReminder()
       if (sessionContext.system.some((part) => part.type === "text" && part.text.includes(reminder))) return
       sessionContext.system.push({ type: "text", text: reminder })
     }),
@@ -785,28 +826,26 @@ function sessionOps(context: PluginV2.Plugin.Context, agentSupport: { namedAgent
 // ---------------------------------------------------------------------------
 
 function teamworkToolsV2(services: {
-  messages: TeamworkMessages
   options: Options
   engine: TeamEngine
   directory: string
 }): ToolV2Info[] {
-  const { messages, options, engine, directory } = services
+  const { options, engine, directory } = services
   return [
     {
       name: "teamwork_create_project",
-      description: messages.tools.createProject,
+      description: MESSAGES.tools.createProject,
       input: v2ObjectSchema(
         {
-          ...BRIEF_PROPERTIES(messages),
-          token_budget: { type: ["integer", "null"], minimum: 1, description: messages.tools.tokenBudget },
-          max_auto_turns: { type: ["integer", "null"], minimum: 1, description: messages.tools.maxAutoTurns },
-          max_duration_seconds: { type: ["integer", "null"], minimum: 1, description: messages.tools.maxDurationSeconds },
-          executor: { ...EXECUTOR_ENUM, description: messages.tools.executor },
-          max_parallel_workers: { type: ["integer", "null"], minimum: 1, maximum: 8, description: messages.tools.maxParallelWorkers },
+          ...BRIEF_PROPERTIES,
+          token_budget: { type: ["integer", "null"], minimum: 1, description: MESSAGES.tools.tokenBudget },
+          max_auto_turns: { type: ["integer", "null"], minimum: 1, description: MESSAGES.tools.maxAutoTurns },
+          max_duration_seconds: { type: ["integer", "null"], minimum: 1, description: MESSAGES.tools.maxDurationSeconds },
+          max_parallel_workers: { type: ["integer", "null"], minimum: 1, maximum: 8, description: MESSAGES.tools.maxParallelWorkers },
           track_stall_reminder_seconds: {
             type: ["integer", "null"],
             minimum: 1,
-            description: messages.tools.trackStallReminderSeconds,
+            description: MESSAGES.tools.trackStallReminderSeconds,
           },
         },
         ["name", "objectives", "requirements", "verification", "acceptance_criteria"],
@@ -828,8 +867,10 @@ function teamworkToolsV2(services: {
             requirements: args.requirements,
             verification: args.verification,
             acceptanceCriteria: args.acceptance_criteria,
-            integrityMode: (args.integrity_mode ?? "development") as IntegrityMode,
-            artifactLocale: isTeamworkLocale(args.artifact_locale) ? args.artifact_locale : "en",
+            integrityMode: args.integrity_mode ?? "development",
+            executionPath: args.execution_path ?? "general",
+            teamScale: args.team_scale ?? null,
+            deep: args.deep ?? true,
           },
           {
             tokenBudget: positiveIntegerOrNull(args.token_budget) ?? positiveIntegerOrNull(options.default_token_budget),
@@ -839,8 +880,6 @@ function teamworkToolsV2(services: {
             maxParallelWorkers:
               clampParallelWorkersOption(args.max_parallel_workers) ??
               clampParallelWorkersOption(options.max_parallel_workers),
-            maxVerificationRetries: nonNegativeIntegerOrNull(options.max_verification_retries),
-            executor: normalizeExecutorOption(args.executor) ?? defaultExecutorFromOptions(options),
             trackStallReminderSeconds: stallFromArgs,
             workingDirectory: directory,
           },
@@ -853,6 +892,7 @@ function teamworkToolsV2(services: {
               created: true,
               project: project.slug,
               phase: project.phase,
+              execution_path: project.brief.executionPath,
               integrity_mode: project.brief.integrityMode,
               artifacts,
               next_step: "Show the artifacts to the user and ask them to run /teamwork-approve (or /teamwork-revise).",
@@ -866,31 +906,26 @@ function teamworkToolsV2(services: {
     {
       name: "teamwork_revise",
       description:
-        "Commit a revised brief for the project that is awaiting approval (or switch the executor while paused). Call after the user requests changes " +
+        "Commit a revised brief for the project that is awaiting approval. Call after the user requests changes " +
         "through /teamwork-revise, passing the complete updated brief.",
       input: v2ObjectSchema(
-        {
-          ...BRIEF_PROPERTIES(messages),
-          executor: { ...EXECUTOR_ENUM, description: messages.tools.executor },
-        },
+        { ...BRIEF_PROPERTIES },
         ["name", "objectives", "requirements", "verification", "acceptance_criteria"],
       ),
       options: { codemode: false },
       execute: async (rawArgs, toolContext) => {
         const args = rawArgs as BriefArgs
-        const project = await updateProjectBrief(
-          toolContext.sessionID,
-          {
-            name: args.name,
-            objectives: args.objectives,
-            requirements: args.requirements,
-            verification: args.verification,
-            acceptanceCriteria: args.acceptance_criteria,
-            integrityMode: (args.integrity_mode ?? "development") as IntegrityMode,
-            artifactLocale: isTeamworkLocale(args.artifact_locale) ? args.artifact_locale : "en",
-          },
-          { executor: normalizeExecutorOption(args.executor) },
-        )
+        const project = await updateProjectBrief(toolContext.sessionID, {
+          name: args.name,
+          objectives: args.objectives,
+          requirements: args.requirements,
+          verification: args.verification,
+          acceptanceCriteria: args.acceptance_criteria,
+          integrityMode: args.integrity_mode ?? "development",
+          executionPath: args.execution_path ?? "general",
+          teamScale: args.team_scale ?? null,
+          deep: args.deep ?? true,
+        })
         const artifacts = await writeArtifacts(directory, project)
         await setProjectArtifacts(toolContext.sessionID, artifacts)
         return {
@@ -960,7 +995,7 @@ function teamworkToolsV2(services: {
     },
     {
       name: "teamwork_get_project",
-      description: messages.tools.getProject,
+      description: MESSAGES.tools.getProject,
       input: v2ObjectSchema({}),
       options: { codemode: false },
       execute: async (_args, toolContext) => {
@@ -992,10 +1027,10 @@ function teamworkToolsV2(services: {
                       title: TEXT_SCHEMA("Short track title."),
                       role: {
                         type: "string",
-                        enum: ["explorer", "worker", "critic", "challenger", "auditor"],
+                        enum: TRACK_ROLES,
                       },
                       assigned_files: TEXT_ARRAY_SCHEMA(
-                        "Exclusive file list for worker tracks; a file may appear in at most one worker track.",
+                        "Exclusive file list for builder tracks; a file may appear in at most one builder track per milestone.",
                       ),
                     },
                     required: ["title", "role"],
@@ -1030,23 +1065,23 @@ function teamworkToolsV2(services: {
     },
     {
       name: "teamwork_report",
-      description: messages.tools.submitReport,
+      description: MESSAGES.tools.submitReport,
       input: v2ObjectSchema(
         {
           role: {
             type: "string",
-            enum: ["orchestrator", "explorer", "worker", "critic", "challenger", "auditor", "successAuditor"],
-            description: messages.tools.role,
+            enum: REPORT_ROLES,
+            description: MESSAGES.tools.role,
           },
           verdict: {
             type: "string",
             enum: ["pass", "fail", "blocked"],
-            description: messages.tools.verdict,
+            description: MESSAGES.tools.verdict,
           },
-          findings: TEXT_ARRAY_SCHEMA(messages.tools.findings),
-          evidence: TEXT_ARRAY_SCHEMA(messages.tools.evidence),
-          blockers: TEXT_ARRAY_SCHEMA(messages.tools.blockers),
-          artifacts_written: TEXT_ARRAY_SCHEMA(messages.tools.artifactsWritten),
+          findings: TEXT_ARRAY_SCHEMA(MESSAGES.tools.findings),
+          evidence: TEXT_ARRAY_SCHEMA(MESSAGES.tools.evidence),
+          blockers: TEXT_ARRAY_SCHEMA(MESSAGES.tools.blockers),
+          artifacts_written: TEXT_ARRAY_SCHEMA(MESSAGES.tools.artifactsWritten),
         },
         ["role", "verdict"],
       ),

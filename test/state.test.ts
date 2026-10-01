@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, expect, test } from "bun:test"
-import { mkdtemp, readFile, readdir, rm } from "node:fs/promises"
+import { mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import {
@@ -9,7 +9,9 @@ import {
   createProject,
   failTrackSession,
   getProject,
+  normalizeExecutionPath,
   normalizeSlug,
+  normalizeTeamScale,
   pauseProject,
   resumeProject,
   setMilestonePlan,
@@ -17,6 +19,7 @@ import {
   submitTrackReport,
   recordAdhocSession,
 } from "../src/state"
+import type { Brief } from "../src/state"
 
 let stateDir: string
 let originalStatePath: string | undefined
@@ -33,24 +36,36 @@ afterEach(async () => {
   await rm(stateDir, { recursive: true, force: true })
 })
 
-const BRIEF = {
+const BRIEF: Brief = {
   name: "Fastify Migration",
   objectives: "Migrate the REST API from Express to Fastify.",
   requirements: "All existing routes keep their behavior; TypeScript throughout.",
   verification: "The migrated service must pass the existing integration test suite.",
   acceptanceCriteria: "npm test passes with zero failures on the Fastify server.",
-  integrityMode: "development" as const,
-  artifactLocale: "en" as const,
+  integrityMode: "development",
+  executionPath: "general",
+  teamScale: null,
+  deep: true,
 }
 
-function briefOf(overrides: Partial<typeof BRIEF> = {}) {
+function briefOf(overrides: Partial<Brief> = {}) {
   return { ...BRIEF, ...overrides }
 }
 
 test("normalizeSlug produces kebab-case slugs and rejects unusable names", () => {
   expect(normalizeSlug("Fastify Migration!")).toBe("fastify-migration")
-  expect(normalizeSlug("  遷移 專案 ")).toBe("遷移-專案")
+  expect(normalizeSlug("  migration project ")).toBe("migration-project")
   expect(() => normalizeSlug("!!!")).toThrow()
+})
+
+test("execution path and knobs normalize with safe defaults", () => {
+  expect(normalizeExecutionPath("review")).toBe("review")
+  expect(normalizeExecutionPath("math-large")).toBe("math-large")
+  expect(normalizeExecutionPath("bogus")).toBe("general")
+  expect(normalizeExecutionPath(undefined)).toBe("general")
+  expect(normalizeTeamScale("L")).toBe("L")
+  expect(normalizeTeamScale("XL")).toBeNull()
+  expect(normalizeTeamScale(undefined)).toBeNull()
 })
 
 test("createProject persists a project awaiting approval with atomic state file", async () => {
@@ -59,10 +74,23 @@ test("createProject persists a project awaiting approval with atomic state file"
   expect(project.slug).toBe("fastify-migration")
   // The brief name is stored normalized (it doubles as the slug).
   expect(project.brief.name).toBe("fastify-migration")
+  expect(project.brief.executionPath).toBe("general")
+  expect(project.brief.deep).toBe(true)
   expect(project.workingDirectory).toBeNull()
 
   const raw = await readFile(process.env.OPENCODE_TEAMWORK_STATE_PATH!, "utf8")
-  expect(JSON.parse(raw).projects.s1.brief.name).toBe("fastify-migration")
+  const parsed = JSON.parse(raw)
+  expect(parsed.version).toBe(2)
+  expect(parsed.projects.s1.brief.name).toBe("fastify-migration")
+})
+
+test("v1 state files are dropped without failing (no old-project support)", async () => {
+  await createProject("s1", briefOf())
+  const stateFile = process.env.OPENCODE_TEAMWORK_STATE_PATH!
+  const raw = JSON.parse(await readFile(stateFile, "utf8"))
+  raw.version = 1
+  await writeFile(stateFile, JSON.stringify(raw), "utf8")
+  expect(await getProject("s1")).toBeNull()
 })
 
 test("a session cannot hold two non-closed projects", async () => {
@@ -90,6 +118,12 @@ test("approve rejects projects that are not awaiting approval", async () => {
   await createProject("s1", briefOf())
   await approveProject("s1", {})
   await expect(approveProject("s1", {})).rejects.toThrow(/not awaiting approval/)
+})
+
+test("brief can only be revised while awaiting approval", async () => {
+  await createProject("s1", briefOf())
+  await approveProject("s1", {})
+  await expect(createProject("s1", briefOf({ name: "Other" }))).rejects.toThrow()
 })
 
 test("cancel closes the project and blocks further transitions", async () => {
@@ -122,6 +156,23 @@ test("setMilestonePlan persists milestones with sequential ids", async () => {
   expect(project.milestones.map((milestone) => milestone.id)).toEqual(["m1", "m2"])
   expect(project.activeMilestoneIndex).toBe(0)
   expect(project.milestones[1]!.tracks.map((track) => track.id)).toEqual(["m2t1", "m2t2"])
+})
+
+test("math and review roles persist in plans", async () => {
+  await createProject("s1", briefOf({ name: "Proof", executionPath: "math" }))
+  await approveProject("s1", {})
+  const project = await setMilestonePlan("s1", [
+    {
+      title: "Prove bound",
+      description: "Prove the bound.",
+      tracks: [
+        { title: "Candidate", role: "prover", assignedFiles: [] },
+        { title: "Attack", role: "falsifier", assignedFiles: [] },
+        { title: "Judge", role: "verifier", assignedFiles: [] },
+      ],
+    },
+  ])
+  expect(project.milestones[0]!.tracks.map((track) => track.role)).toEqual(["prover", "falsifier", "verifier"])
 })
 
 test("assignTrackSession tracks role sessions and counts spawns", async () => {
@@ -201,38 +252,15 @@ test("corrupt state is quarantined before recovery", async () => {
   void valid
 })
 
-test("executor defaults to native and parallel workers clamp to 1..8", async () => {
-  const { clampParallelWorkers, isExecutorMode, normalizeExecutorMode } = await import("../src/state")
-  expect(isExecutorMode("native")).toBe(true)
-  expect(isExecutorMode("isolated")).toBe(true)
-  expect(isExecutorMode("other")).toBe(false)
-  expect(normalizeExecutorMode("isolated")).toBe("isolated")
-  expect(normalizeExecutorMode("bogus")).toBe("native")
+test("parallel workers clamp to 1..8 and default to 5", async () => {
+  const { clampParallelWorkers } = await import("../src/state")
   expect(clampParallelWorkers(99)).toBe(8)
   expect(clampParallelWorkers(0)).toBe(1)
-  const project = await createProject("s-exec", briefOf(), { executor: "bogus" as never })
-  expect(project.executor).toBe("native")
+  const project = await createProject("s-exec", briefOf())
   expect(project.maxParallelWorkers).toBe(5)
   expect(project.trackStallReminderSeconds).toBe(1800)
   const capped = await createProject("s-cap", briefOf({ name: "Cap" }), { maxParallelWorkers: 99 })
   expect(capped.maxParallelWorkers).toBe(8)
-})
-
-test("executor can be switched while paused but not while executing", async () => {
-  const { setProjectExecutor, updateProjectBrief } = await import("../src/state")
-  await createProject("s-sw", briefOf())
-  await approveProject("s-sw", {})
-  await pauseProject("s-sw", "pause for switch")
-  const switched = await setProjectExecutor("s-sw", "isolated")
-  expect(switched.executor).toBe("isolated")
-  const revised = await updateProjectBrief(
-    "s-sw",
-    { ...briefOf(), name: "Fastify Migration" },
-    { executor: "native" },
-  )
-  expect(revised.executor).toBe("native")
-  await resumeProject("s-sw")
-  await expect(setProjectExecutor("s-sw", "isolated")).rejects.toThrow(/only be switched while awaiting/)
 })
 
 test("submitTrackReportByID and permission timer suspension work", async () => {

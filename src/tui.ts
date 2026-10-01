@@ -4,8 +4,6 @@ import { createElement, insert, setProp } from "@opentui/solid"
 import { createEffect, createMemo, createSignal, onCleanup } from "solid-js"
 import { getProjectSync } from "./state"
 import type { ProjectSnapshot } from "./state"
-import type { TeamworkLocale, TeamworkMessages } from "./i18n"
-import { messagesFor, presentIntegrityMode, presentPhase, resolveLocale } from "./i18n"
 
 /**
  * The Teamwork sidebar reads the shared project state file directly
@@ -14,6 +12,42 @@ import { messagesFor, presentIntegrityMode, presentPhase, resolveLocale } from "
  * scanning required. A 1-second poll keeps the live clock and track counts
  * fresh while the project executes.
  */
+
+const TUI_COPY = {
+  title: "Teamwork",
+  commandDescription: "View, pause, resume, or cancel the Teamwork project",
+  refresh: "Refresh",
+  refreshDescription: "Ask the agent to read the current project state",
+  status: "Status",
+  statusDescription: "Ask the agent to show detailed project status",
+  pause: "Pause",
+  pauseDescription: "Pause the running team",
+  resume: "Resume",
+  resumeDescription: "Resume the paused team",
+  cancel: "Cancel",
+  cancelDescription: "Cancel this session's project",
+  refreshPrompt: "Call teamwork_get_project for this session and report the current project state briefly.",
+  statusPrompt: "Call teamwork_get_project for this session and report detailed project status, including all milestones and tracks.",
+  pausePrompt: "Pause the current session project by calling teamwork_pause. Report the result briefly.",
+  resumePrompt: "Resume the current session project by calling teamwork_resume, then the team continues autonomously. Report the result briefly.",
+  cancelPrompt: "Cancel the current session project by calling teamwork_cancel. Report whether a project was cancelled.",
+  openSession: "Open a session before viewing project state.",
+  noProject: "No recent Teamwork project state found in this session.",
+  project: "Project",
+  phase: "Phase",
+  path: "Path",
+  integrity: "Integrity",
+  milestoneProgress: "Milestones",
+  tracks: "Active tracks",
+  time: "Time",
+  tokens: "Tokens",
+  tokensRemaining: "Tokens remaining",
+  latestUpdate: "Latest update",
+  completed: "Project completed",
+  cancelled: "Project cancelled",
+  paused: "Project paused",
+  blocker: "Blocker",
+}
 
 type ElementChild = string | number | boolean | null | undefined | object | (() => ElementChild)
 
@@ -140,23 +174,23 @@ export function milestoneProgress(project: ProjectSnapshot) {
   return `${passed}/${project.milestones.length}`
 }
 
-export function formatProjectSummary(project: ProjectSnapshot | null, messages: TeamworkMessages, locale: TeamworkLocale) {
-  if (!project) return messages.tui.noProject
-  const executor = (project as { executor?: string }).executor ?? "native"
+export function formatProjectSummary(project: ProjectSnapshot | null) {
+  if (!project) return TUI_COPY.noProject
+  const team = project.brief.teamScale ?? "default"
   const lines = [
-    `${messages.tui.project}: ${project.slug}`,
-    `${messages.tui.phase}: ${presentPhase(project.phase, locale)}`,
-    `${messages.tui.integrity}: ${presentIntegrityMode(project.brief.integrityMode, locale)}`,
-    `Executor: ${executor} | workers: ${(project as { maxParallelWorkers?: number }).maxParallelWorkers ?? 5}`,
-    `${messages.tui.milestoneProgress}: ${milestoneProgress(project)}${
+    `${TUI_COPY.project}: ${project.slug}`,
+    `${TUI_COPY.phase}: ${project.phase}`,
+    `${TUI_COPY.path}: ${project.brief.executionPath} | ${TUI_COPY.integrity}: ${project.brief.integrityMode}`,
+    `Speed: workers=${project.maxParallelWorkers}, team=${team}, deep=${project.brief.deep ? "on" : "off"}`,
+    `${TUI_COPY.milestoneProgress}: ${milestoneProgress(project)}${
       project.activeMilestoneIndex >= 0 ? ` (m${project.activeMilestoneIndex + 1})` : ""
     }`,
-    `${messages.tui.tracks}: ${activeTrackCount(project)}`,
-    `${messages.tui.time}: ${formatDuration(liveTimeUsedSeconds(project))}`,
-    `${messages.tui.tokens}: ${project.tokensUsed}${project.tokenBudget == null ? "" : `/${project.tokenBudget}`}`,
+    `${TUI_COPY.tracks}: ${activeTrackCount(project)}`,
+    `${TUI_COPY.time}: ${formatDuration(liveTimeUsedSeconds(project))}`,
+    `${TUI_COPY.tokens}: ${project.tokensUsed}${project.tokenBudget == null ? "" : `/${project.tokenBudget}`}`,
   ]
-  if (project.remainingTokens != null) lines.push(`${messages.tui.tokensRemaining}: ${project.remainingTokens}`)
-  if (project.sentinelUpdate) lines.push(`${messages.tui.latestUpdate}: ${project.sentinelUpdate.message}`)
+  if (project.remainingTokens != null) lines.push(`${TUI_COPY.tokensRemaining}: ${project.remainingTokens}`)
+  if (project.sentinelUpdate) lines.push(`${TUI_COPY.latestUpdate}: ${project.sentinelUpdate.message}`)
   return lines.join("\n")
 }
 
@@ -170,12 +204,7 @@ export function projectForSession(sessionID: string): ProjectSnapshot | null {
   }
 }
 
-function ProjectSidebar(
-  _api: TuiPluginApi,
-  messages: TeamworkMessages,
-  locale: TeamworkLocale,
-  sessionID: string,
-) {
+function ProjectSidebar(_api: TuiPluginApi, sessionID: string) {
   const theme = _api.theme.current
   const [tick, setTick] = createSignal(currentEpochSeconds())
   const timer = setInterval(() => setTick(currentEpochSeconds()), 1000)
@@ -189,32 +218,33 @@ function ProjectSidebar(
       const snapshot = project()
       if (!snapshot) return null
       if (snapshot.phase === "complete") {
-        return text({ fg: theme.primary }, [`${messages.tui.completed} (${formatDuration(snapshot.timeUsedSeconds)})`])
+        return text({ fg: theme.primary }, [`${TUI_COPY.completed} (${formatDuration(snapshot.timeUsedSeconds)})`])
       }
       if (snapshot.phase === "cancelled") {
-        return text({ fg: theme.textMuted }, [`${messages.tui.cancelled} (${formatDuration(snapshot.timeUsedSeconds)})`])
+        return text({ fg: theme.textMuted }, [`${TUI_COPY.cancelled} (${formatDuration(snapshot.timeUsedSeconds)})`])
       }
       return box({}, [
-        text({ fg: theme.text }, [`${messages.tui.title}: ${snapshot.slug}`]),
-        text({ fg: theme.textMuted }, [`${messages.tui.phase}: ${presentPhase(snapshot.phase, locale)}`]),
+        text({ fg: theme.text }, [`${TUI_COPY.title}: ${snapshot.slug}`]),
+        text({ fg: theme.textMuted }, [`${TUI_COPY.phase}: ${snapshot.phase}`]),
         text({ fg: theme.textMuted }, [
-          () => `${messages.tui.time}: ${formatDuration(liveTimeUsedSeconds(snapshot, tick()))}`,
+          () => `${TUI_COPY.time}: ${formatDuration(liveTimeUsedSeconds(snapshot, tick()))}`,
         ]),
         text({ fg: theme.textMuted }, [
-          `${messages.tui.tokens}: ${snapshot.tokensUsed}${snapshot.tokenBudget == null ? "" : `/${snapshot.tokenBudget}`}`,
+          `${TUI_COPY.tokens}: ${snapshot.tokensUsed}${snapshot.tokenBudget == null ? "" : `/${snapshot.tokenBudget}`}`,
         ]),
-        text({ fg: theme.textMuted }, [`${messages.tui.integrity}: ${presentIntegrityMode(snapshot.brief.integrityMode, locale)}`]),
+        text({ fg: theme.textMuted }, [`${TUI_COPY.path}: ${snapshot.brief.executionPath}`]),
+        text({ fg: theme.textMuted }, [`${TUI_COPY.integrity}: ${snapshot.brief.integrityMode}`]),
         text({ fg: theme.textMuted }, [
-          `${messages.tui.milestoneProgress}: ${milestoneProgress(snapshot)}${
+          `${TUI_COPY.milestoneProgress}: ${milestoneProgress(snapshot)}${
             snapshot.activeMilestoneIndex >= 0 ? ` (m${snapshot.activeMilestoneIndex + 1})` : ""
           }`,
         ]),
-        text({ fg: theme.textMuted }, [`${messages.tui.tracks}: ${activeTrackCount(snapshot)}`]),
+        text({ fg: theme.textMuted }, [`${TUI_COPY.tracks}: ${activeTrackCount(snapshot)}`]),
         ...(snapshot.sentinelUpdate
-          ? [text({ fg: theme.textMuted }, [`${messages.tui.latestUpdate}: ${snapshot.sentinelUpdate.message}`])]
+          ? [text({ fg: theme.textMuted }, [`${TUI_COPY.latestUpdate}: ${snapshot.sentinelUpdate.message}`])]
           : []),
         ...(snapshot.lastStatus ? [text({ fg: theme.textMuted }, [snapshot.lastStatus])] : []),
-        ...(snapshot.blocker ? [text({ fg: theme.textMuted }, [`${messages.reports.blocker}: ${snapshot.blocker}`])] : []),
+        ...(snapshot.blocker ? [text({ fg: theme.textMuted }, [`${TUI_COPY.blocker}: ${snapshot.blocker}`])] : []),
       ])
     },
   ])
@@ -245,8 +275,8 @@ function currentSessionID(api: TuiPluginApi) {
   return typeof sessionID === "string" ? sessionID : undefined
 }
 
-function toast(api: TuiPluginApi, messages: TeamworkMessages, message: string, variant: "info" | "success" | "warning" | "error" = "info") {
-  api.ui.toast({ title: messages.tui.title, message, variant, duration: 2500 })
+function toast(api: TuiPluginApi, message: string, variant: "info" | "success" | "warning" | "error" = "info") {
+  api.ui.toast({ title: TUI_COPY.title, message, variant, duration: 2500 })
 }
 
 async function sendProjectPrompt(api: TuiPluginApi, sessionID: string, prompt: string) {
@@ -258,7 +288,6 @@ async function sendProjectPrompt(api: TuiPluginApi, sessionID: string, prompt: s
 
 function actionOption(
   api: TuiPluginApi,
-  messages: TeamworkMessages,
   sessionID: string,
   title: string,
   value: string,
@@ -272,37 +301,32 @@ function actionOption(
     onSelect: () => {
       void sendProjectPrompt(api, sessionID, prompt)
         .then(() => api.ui.dialog.clear())
-        .catch((error) => toast(api, messages, error instanceof Error ? error.message : String(error), "error"))
+        .catch((error) => toast(api, error instanceof Error ? error.message : String(error), "error"))
     },
   }
 }
 
-function showProjectDialog(
-  api: TuiPluginApi,
-  messages: TeamworkMessages,
-  locale: TeamworkLocale,
-  sessionID: string,
-) {
+function showProjectDialog(api: TuiPluginApi, sessionID: string) {
   const DialogSelect = api.ui.DialogSelect
   const project = projectForSession(sessionID)
   const options = [
-    actionOption(api, messages, sessionID, messages.tui.refresh, "refresh", messages.tui.refreshDescription, messages.tui.refreshPrompt),
-    actionOption(api, messages, sessionID, messages.tui.status, "status", messages.tui.statusDescription, messages.tui.statusPrompt),
+    actionOption(api, sessionID, TUI_COPY.refresh, "refresh", TUI_COPY.refreshDescription, TUI_COPY.refreshPrompt),
+    actionOption(api, sessionID, TUI_COPY.status, "status", TUI_COPY.statusDescription, TUI_COPY.statusPrompt),
     ...(project?.phase === "executing"
-      ? [actionOption(api, messages, sessionID, messages.tui.pause, "pause", messages.tui.pauseDescription, messages.tui.pausePrompt)]
+      ? [actionOption(api, sessionID, TUI_COPY.pause, "pause", TUI_COPY.pauseDescription, TUI_COPY.pausePrompt)]
       : []),
     ...(project?.phase === "paused"
-      ? [actionOption(api, messages, sessionID, messages.tui.resume, "resume", messages.tui.resumeDescription, messages.tui.resumePrompt)]
+      ? [actionOption(api, sessionID, TUI_COPY.resume, "resume", TUI_COPY.resumeDescription, TUI_COPY.resumePrompt)]
       : []),
     ...(project && project.phase !== "complete" && project.phase !== "cancelled"
-      ? [actionOption(api, messages, sessionID, messages.tui.cancel, "cancel", messages.tui.cancelDescription, messages.tui.cancelPrompt)]
+      ? [actionOption(api, sessionID, TUI_COPY.cancel, "cancel", TUI_COPY.cancelDescription, TUI_COPY.cancelPrompt)]
       : []),
   ]
   api.ui.dialog.setSize("large")
   api.ui.dialog.replace(() =>
     DialogSelect({
-      title: messages.tui.title,
-      placeholder: formatProjectSummary(project, messages, locale),
+      title: TUI_COPY.title,
+      placeholder: formatProjectSummary(project),
       options,
       onSelect(option) {
         option.onSelect?.()
@@ -334,30 +358,28 @@ function registerProjectCommand(api: TuiPluginApi, command: TuiCommand) {
 
 // --- V1 TUI plugin -----------------------------------------------------------
 
-const tui: TuiPlugin = async (api, options) => {
-  const locale = resolveLocale(typeof options?.locale === "string" ? options.locale : undefined)
-  const messages = messagesFor(locale)
+const tui: TuiPlugin = async (api) => {
   api.slots.register({
     order: 125,
     slots: {
       sidebar_content(_ctx, props) {
-        return ProjectSidebar(api, messages, locale, props.session_id)
+        return ProjectSidebar(api, props.session_id)
       },
     },
   })
 
   registerProjectCommand(api, {
-    title: messages.tui.title,
+    title: TUI_COPY.title,
     value: "teamwork.show",
-    category: messages.tui.title,
-    description: messages.tui.commandDescription,
+    category: TUI_COPY.title,
+    description: TUI_COPY.commandDescription,
     onSelect: () => {
       const sessionID = currentSessionID(api)
       if (!sessionID) {
-        toast(api, messages, messages.tui.openSession, "warning")
+        toast(api, TUI_COPY.openSession, "warning")
         return
       }
-      showProjectDialog(api, messages, locale, sessionID)
+      showProjectDialog(api, sessionID)
     },
   })
 }
@@ -370,62 +392,47 @@ function currentSessionIDV2(api: TuiPluginV2.Context) {
   return route.sessionID
 }
 
-function toastV2(
-  api: TuiPluginV2.Context,
-  messages: TeamworkMessages,
-  message: string,
-  variant: "info" | "success" | "warning" | "error" = "info",
-) {
-  api.ui.toast.show({ title: messages.tui.title, message, variant, duration: 2500 })
+function toastV2(api: TuiPluginV2.Context, message: string, variant: "info" | "success" | "warning" | "error" = "info") {
+  api.ui.toast.show({ title: TUI_COPY.title, message, variant, duration: 2500 })
 }
 
-async function showProjectDialogV2(
-  api: TuiPluginV2.Context,
-  messages: TeamworkMessages,
-  locale: TeamworkLocale,
-  sessionID: string,
-) {
+async function showProjectDialogV2(api: TuiPluginV2.Context, sessionID: string) {
   const project = projectForSession(sessionID)
   const options = [
-    { title: messages.tui.refresh, value: "refresh", description: messages.tui.refreshDescription },
-    { title: messages.tui.status, value: "status", description: messages.tui.statusDescription },
+    { title: TUI_COPY.refresh, value: "refresh", description: TUI_COPY.refreshDescription },
+    { title: TUI_COPY.status, value: "status", description: TUI_COPY.statusDescription },
     ...(project?.phase === "executing"
-      ? [{ title: messages.tui.pause, value: "pause", description: messages.tui.pauseDescription }]
+      ? [{ title: TUI_COPY.pause, value: "pause", description: TUI_COPY.pauseDescription }]
       : []),
     ...(project?.phase === "paused"
-      ? [{ title: messages.tui.resume, value: "resume", description: messages.tui.resumeDescription }]
+      ? [{ title: TUI_COPY.resume, value: "resume", description: TUI_COPY.resumeDescription }]
       : []),
     ...(project && project.phase !== "complete" && project.phase !== "cancelled"
-      ? [{ title: messages.tui.cancel, value: "cancel", description: messages.tui.cancelDescription }]
+      ? [{ title: TUI_COPY.cancel, value: "cancel", description: TUI_COPY.cancelDescription }]
       : []),
   ]
   api.ui.dialog.set({ size: "large" })
   const selected = await api.ui.dialog.select({
-    title: messages.tui.title,
-    placeholder: formatProjectSummary(project, messages, locale),
+    title: TUI_COPY.title,
+    placeholder: formatProjectSummary(project),
     options,
   })
   const prompt =
-    selected === "refresh" ? messages.tui.refreshPrompt
-    : selected === "status" ? messages.tui.statusPrompt
-    : selected === "pause" ? messages.tui.pausePrompt
-    : selected === "resume" ? messages.tui.resumePrompt
-    : selected === "cancel" ? messages.tui.cancelPrompt
+    selected === "refresh" ? TUI_COPY.refreshPrompt
+    : selected === "status" ? TUI_COPY.statusPrompt
+    : selected === "pause" ? TUI_COPY.pausePrompt
+    : selected === "resume" ? TUI_COPY.resumePrompt
+    : selected === "cancel" ? TUI_COPY.cancelPrompt
     : undefined
   if (!prompt) return
   try {
     await api.client.session.prompt({ sessionID, text: prompt })
   } catch (error) {
-    toastV2(api, messages, error instanceof Error ? error.message : String(error), "error")
+    toastV2(api, error instanceof Error ? error.message : String(error), "error")
   }
 }
 
-function ProjectSidebarV2(
-  api: TuiPluginV2.Context,
-  messages: TeamworkMessages,
-  locale: TeamworkLocale,
-  sessionID: string,
-) {
+function ProjectSidebarV2(api: TuiPluginV2.Context, sessionID: string) {
   const colors = projectColorsV2(api.theme)
   const [tick, setTick] = createSignal(currentEpochSeconds())
   createEffect(() => {
@@ -441,54 +448,53 @@ function ProjectSidebarV2(
       const snapshot = project()
       if (!snapshot) return null
       if (snapshot.phase === "complete") {
-        return text({ fg: colors.success }, [
-          `${messages.tui.completed} (${formatDuration(snapshot.timeUsedSeconds)})`,
-        ])
+        return text({ fg: colors.success }, [`${TUI_COPY.completed} (${formatDuration(snapshot.timeUsedSeconds)})`])
       }
       if (snapshot.phase === "cancelled") {
-        return text({ fg: colors.muted }, [`${messages.tui.cancelled} (${formatDuration(snapshot.timeUsedSeconds)})`])
+        return text({ fg: colors.muted }, [`${TUI_COPY.cancelled} (${formatDuration(snapshot.timeUsedSeconds)})`])
       }
       return box({}, [
-        text({ fg: colors.text }, [`${messages.tui.title}: ${snapshot.slug}`]),
-        text({ fg: colors.muted }, [`${messages.tui.phase}: ${presentPhase(snapshot.phase, locale)}`]),
-        text({ fg: colors.muted }, [`${messages.tui.integrity}: ${presentIntegrityMode(snapshot.brief.integrityMode, locale)}`]),
-        text({ fg: colors.muted }, [() => `${messages.tui.time}: ${formatDuration(liveTimeUsedSeconds(snapshot, tick()))}`]),
+        text({ fg: colors.text }, [`${TUI_COPY.title}: ${snapshot.slug}`]),
+        text({ fg: colors.muted }, [`${TUI_COPY.phase}: ${snapshot.phase}`]),
+        text({ fg: colors.muted }, [`${TUI_COPY.path}: ${snapshot.brief.executionPath}`]),
+        text({ fg: colors.muted }, [`${TUI_COPY.integrity}: ${snapshot.brief.integrityMode}`]),
+        text({ fg: colors.muted }, [() => `${TUI_COPY.time}: ${formatDuration(liveTimeUsedSeconds(snapshot, tick()))}`]),
         text({ fg: colors.muted }, [
-          `${messages.tui.tokens}: ${snapshot.tokensUsed}${snapshot.tokenBudget == null ? "" : `/${snapshot.tokenBudget}`}`,
+          `${TUI_COPY.tokens}: ${snapshot.tokensUsed}${snapshot.tokenBudget == null ? "" : `/${snapshot.tokenBudget}`}`,
         ]),
         text({ fg: colors.muted }, [
-          `${messages.tui.milestoneProgress}: ${milestoneProgress(snapshot)}${
+          `${TUI_COPY.milestoneProgress}: ${milestoneProgress(snapshot)}${
             snapshot.activeMilestoneIndex >= 0 ? ` (m${snapshot.activeMilestoneIndex + 1})` : ""
           }`,
         ]),
-        text({ fg: colors.muted }, [`${messages.tui.tracks}: ${activeTrackCount(snapshot)}`]),
+        text({ fg: colors.muted }, [`${TUI_COPY.tracks}: ${activeTrackCount(snapshot)}`]),
         ...(snapshot.sentinelUpdate
-          ? [text({ fg: colors.muted }, [`${messages.tui.latestUpdate}: ${snapshot.sentinelUpdate.message}`])]
+          ? [text({ fg: colors.muted }, [`${TUI_COPY.latestUpdate}: ${snapshot.sentinelUpdate.message}`])]
           : []),
         ...(snapshot.lastStatus ? [text({ fg: colors.muted }, [snapshot.lastStatus])] : []),
-        ...(snapshot.blocker ? [text({ fg: colors.muted }, [`${messages.reports.blocker}: ${snapshot.blocker}`])] : []),
+        ...(snapshot.blocker ? [text({ fg: colors.muted }, [`${TUI_COPY.blocker}: ${snapshot.blocker}`])] : []),
       ])
     },
   ])
 }
 
-function ProjectKeymapLayerV2(api: TuiPluginV2.Context, messages: TeamworkMessages, locale: TeamworkLocale) {
+function ProjectKeymapLayerV2(api: TuiPluginV2.Context) {
   api.keymap.layer(() => ({
     mode: "global",
     commands: [
       {
         id: "teamwork.show",
-        title: messages.tui.title,
-        description: messages.tui.commandDescription,
-        group: messages.tui.title,
+        title: TUI_COPY.title,
+        description: TUI_COPY.commandDescription,
+        group: TUI_COPY.title,
         palette: true,
         run: () => {
           const sessionID = currentSessionIDV2(api)
           if (!sessionID) {
-            toastV2(api, messages, messages.tui.openSession, "warning")
+            toastV2(api, TUI_COPY.openSession, "warning")
             return
           }
-          void showProjectDialogV2(api, messages, locale, sessionID)
+          void showProjectDialogV2(api, sessionID)
         },
       },
     ],
@@ -501,12 +507,10 @@ function ProjectKeymapLayerV2(api: TuiPluginV2.Context, messages: TeamworkMessag
  * command through a keymap layer mounted from the global `app` slot.
  */
 export function setupTuiV2(context: TuiPluginV2.Context): TuiPluginV2.Cleanup {
-  const locale = resolveLocale(typeof context.options?.locale === "string" ? context.options.locale : undefined)
-  const messages = messagesFor(locale)
   const offSidebar = registerSlotV2(context, "sidebar.content", (props) =>
-    ProjectSidebarV2(context, messages, locale, props.sessionID),
+    ProjectSidebarV2(context, props.sessionID),
   )
-  const offApp = registerSlotV2(context, "app", () => ProjectKeymapLayerV2(context, messages, locale))
+  const offApp = registerSlotV2(context, "app", () => ProjectKeymapLayerV2(context))
   return () => {
     offSidebar()
     offApp()

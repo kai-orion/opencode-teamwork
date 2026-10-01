@@ -1,5 +1,11 @@
 import { expect, test } from "bun:test"
-import { artifactPaths, renderPlanArtifact, renderProgressArtifact, renderRequestArtifact } from "../src/artifacts"
+import {
+  artifactPaths,
+  renderBriefArtifact,
+  renderPlanArtifact,
+  renderProgressArtifact,
+  renderRequestArtifact,
+} from "../src/artifacts"
 import type { Project } from "../src/state"
 
 function project(overrides: Partial<Project> = {}): Project {
@@ -13,7 +19,9 @@ function project(overrides: Partial<Project> = {}): Project {
       verification: "Integration suite passes.",
       acceptanceCriteria: "npm test is green.",
       integrityMode: "demo",
-      artifactLocale: "en",
+      executionPath: "general",
+      teamScale: null,
+      deep: true,
     },
     phase: "executing",
     milestones: [
@@ -76,8 +84,6 @@ function project(overrides: Partial<Project> = {}): Project {
     maxAutoTurns: null,
     maxDurationSeconds: null,
     maxParallelWorkers: 5,
-    maxVerificationRetries: 2,
-    executor: "native",
     trackStallReminderSeconds: 1800,
     planPaused: false,
     sentinelUpdate: { message: "Milestone m1 passed", timestamp: 120 },
@@ -93,12 +99,26 @@ function project(overrides: Partial<Project> = {}): Project {
   }
 }
 
-test("artifact paths live under .opencode/teamwork/<slug>/", () => {
-  const paths = artifactPaths("/repo", "fastify-migration")
+test("artifact paths live under .teamwork/ at the project root", () => {
+  const paths = artifactPaths("/repo")
   const normalized = (value: string) => value.replaceAll("\\", "/")
-  expect(normalized(paths.request)).toBe("/repo/.opencode/teamwork/fastify-migration/request.md")
-  expect(normalized(paths.plan)).toContain("plan.md")
-  expect(normalized(paths.progress)).toContain("progress.md")
+  expect(normalized(paths.dir)).toBe("/repo/.teamwork")
+  expect(normalized(paths.brief)).toBe("/repo/.teamwork/brief.md")
+  expect(normalized(paths.request)).toBe("/repo/.teamwork/request.md")
+  expect(normalized(paths.plan)).toBe("/repo/.teamwork/plan.md")
+  expect(normalized(paths.progress)).toBe("/repo/.teamwork/progress.md")
+  expect(normalized(paths.scratch)).toBe("/repo/.teamwork/scratch")
+  expect(normalized(paths.knowledge)).toBe("/repo/.teamwork/knowledge")
+})
+
+test("brief artifact renders the approved brief with path and knobs", () => {
+  const markdown = renderBriefArtifact(project())
+  expect(markdown).toContain("# Teamwork Project Brief: fastify-migration")
+  expect(markdown).toContain("Migrate the REST API from Express to Fastify.")
+  expect(markdown).toContain("- Execution path: general")
+  expect(markdown).toContain("- Integrity mode: demo")
+  expect(markdown).toContain("workers=5")
+  expect(markdown).toContain("## Acceptance criteria")
 })
 
 test("request artifact renders the full approved brief", () => {
@@ -106,7 +126,6 @@ test("request artifact renders the full approved brief", () => {
   expect(markdown).toContain("# Teamwork Project Request: fastify-migration")
   expect(markdown).toContain("Migrate the REST API from Express to Fastify.")
   expect(markdown).toContain("- Integrity mode: demo")
-  expect(markdown).toContain("Executor: native")
   expect(markdown).toContain("## Acceptance criteria")
 })
 
@@ -124,16 +143,16 @@ test("plan artifact renders the empty-state placeholder before planning", () => 
   expect(markdown).toContain("has not recorded a milestone plan")
 })
 
-test("progress artifact renders phase, sentinel update, and milestone progress", () => {
+test("progress artifact renders phase, path, sentinel update, and milestone progress", () => {
   const markdown = renderProgressArtifact(project())
   expect(markdown).toContain("- Phase: executing")
+  expect(markdown).toContain("- Path: general")
   expect(markdown).toContain("1/2")
   expect(markdown).toContain("Milestone m1 passed")
 })
 
-test("artifacts follow the brief's artifact locale", () => {
-  const localized = project({ brief: { ...project().brief, artifactLocale: "zh-TW" } })
-  const markdown = renderRequestArtifact(localized)
-  expect(markdown).toContain("完整性模式")
-  expect(markdown).toContain("驗收標準")
+test("artifacts are English-only", () => {
+  const markdown = renderRequestArtifact(project())
+  expect(markdown).toContain("Integrity mode")
+  expect(markdown).toContain("Acceptance criteria")
 })
